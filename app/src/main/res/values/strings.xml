@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GPU 风险检测</string>
+    <string name="collector_starting">正在建立采样基线。检测界面可见期间采样，无需任何授权。</string>
+    <string name="start_failed">检测服务未能启动：%1$s</string>
+    <string name="root_watch_description">root 候选尚未达到高风险条件，继续观察负载与 GPU 相关证据。</string>
+    <string name="root_watch_title">发现待观察的 root 进程</string>
+    <string name="monitoring_summary">监听 %1$d · root 候选 %2$d · cgroup 路径异常 %3$d</string>
+    <string name="monitored_processes_metric">监听进程</string>
+    <string name="ordinary_mode">无需任何授权 · 普通应用 UID %1$s</string>
+    <string name="global_gpu_waiting">全局 GPU 证据：等待采样</string>
+    <string name="global_gpu_unknown">全局 GPU：证据不可用 · 未归属任何 PID</string>
+    <string name="global_gpu_baseline">全局 GPU：正在建立比较基线 · 未归属任何 PID</string>
+    <string name="global_gpu_active">全局 GPU：计数有进展 · 未归属任何 PID</string>
+    <string name="global_gpu_quiet">全局 GPU：窗口内未见计数进展 · 未归属任何 PID</string>
+    <string name="cpu_unavailable_title">尚未取得有效的 CPU 样本</string>
+    <string name="sampling_status">更新 %1$s  ·  已探测 PID %2$d  ·  读取受限 %3$d</string>
+    <string name="no_retained_results">不保留上次检测结果</string>
+    <string name="parse_failed">采集结果无法解析：%1$s</string>
+    <string name="candidates_title">监听进程</string>
+    <string name="no_monitored_candidates">尚未发现需要监听的进程</string>
+    <string name="no_active_cpu_processes">当前没有达到显示阈值的进程</string>
+    <string name="low_cpu_hidden_description" formatted="false">CPU 负载低于 0.2% 的进程已隐藏，达到阈值后自动显示。</string>
+    <string name="monitored_candidates_description">发现 root 候选或连续确认 cgroup 路径未匹配后，自动加入监听。</string>
+    <string name="cgroup_check_unavailable">cgroup 路径探测校准不可用</string>
+    <string name="cgroup_check_available">cgroup 路径探测可用</string>
+    <string name="cgroup_anomaly_title">发现 cgroup 路径异常</string>
+    <string name="cgroup_anomaly_description">已加入持续监听，继续观察 CPU 与 GPU 活动。</string>
+    <string name="cgroup_anomaly_monitoring">cgroup路径未匹配 · 监听中</string>
+    <string name="cgroup_anomaly_stable">已连续确认 %1$d 次</string>
+    <string name="environment_anomaly">环境异常</string>
+    <string name="environment_anomaly_description">发现 pidfd 存活状态与进程目录可见性冲突；下方可查看依据，root 高风险数独立统计。</string>
+    <string name="environment_conflict_summary">pidfd 仍存活，但 /proc/PID 复查返回不存在。冲突 PID：%1$s\n环境一致性异常不表示这些 PID 已确认属于 root。</string>
+    <string name="environment_conflict_details">点击查看 pidfd / stat 原始依据</string>
+    <string name="counted_title">%1$s · %2$d</string>
+    <string name="lifecycle_association_line">进程启停关联 · %1$s</string>
+    <string name="gpu_overlay_confirmed">确认使用gpu悬浮窗</string>
+    <string name="lifecycle_onset_ambiguous">多个进程或槽同步，时序关联有歧义</string>
+    <string name="lifecycle_pending">观察出现时序中</string>
+    <string name="lifecycle_no_evidence">未观察到生命周期关联</string>
+    <string name="lifecycle_exit_match">PID %1$d 退出后，槽 %2$s 停止推进（确认使用gpu悬浮窗）</string>
+    <string name="lifecycle_exit_ambiguous">PID %1$d 退出前后存在同步变化，关联有歧义</string>
+</resources>

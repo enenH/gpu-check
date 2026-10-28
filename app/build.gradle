@@ -1,0 +1,60 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.gpucheck.app'
+    compileSdk 35
+    ndkVersion '29.0.13113456'
+    defaultConfig {
+        applicationId 'com.gpucheck.app'
+        minSdk 26
+        targetSdk 35
+        versionCode 9
+        versionName '1.3.4'
+        testInstrumentationRunner project.findProperty('gpuCheckTestRunner') ?: 'com.gpucheck.app.SelfGpuInstrumentation'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    sourceSets.main.jniLibs.srcDirs = [layout.buildDirectory.dir('generated/probeJni')]
+    packaging { jniLibs { useLegacyPackaging = true; keepDebugSymbols += '**/libgpu_probe.so' } }
+    buildTypes {
+        release { minifyEnabled false }
+    }
+}
+
+def probeOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_probe.so')
+tasks.register('compileProbe', Exec) {
+    def source = rootProject.file('native/probe.cpp')
+    inputs.files(fileTree(rootProject.file('native')) { include '**/*.cpp', '**/*.h' })
+    outputs.file(probeOutput)
+    doFirst {
+        def output = probeOutput.get().asFile
+        output.parentFile.mkdirs()
+        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
+        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
+        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fPIE', '-pie', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined', source.absolutePath, '-o', output.absolutePath
+    }
+}
+def selfGpuOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_self.so')
+tasks.register('compileSelfGpu', Exec) {
+    def source = rootProject.file('native/self_gpu.cpp')
+    inputs.file(source)
+    outputs.file(selfGpuOutput)
+    doFirst {
+        def output = selfGpuOutput.get().asFile
+        output.parentFile.mkdirs()
+        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
+        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
+        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+                '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
+                source.absolutePath, '-o', output.absolutePath
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn 'compileProbe', 'compileSelfGpu' }
