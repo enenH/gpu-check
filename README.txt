@@ -62,6 +62,19 @@ JDK 17 或更新版本、Android SDK 35、NDK 29.0.13113456、Gradle 8.10.1。
 APK：app\build\outputs\apk\debug\app-debug.apk
 当前原生 ABI：arm64-v8a；最低 Android 8.0（API 26）。
 
+GitHub Actions 自动构建与发布
+.github/workflows/build-release.yml 在每次分支或标签 push 后构建，也支持在 Actions 页面手动运行。
+删除分支或标签不构建；连续 push 不取消之前的构建。
+CI 使用 JDK 17、SDK 35、Build Tools 34.0.0、NDK 29.0.13113456 和仓库自带的 Gradle Wrapper。
+执行 assembleDebug、assembleRelease、lintDebug；全部成功后直接发布到 GitHub Releases，不上传 Actions 构建物。
+每次运行使用独立的 build-运行ID-重跑次数 标签，指向本次构建的提交，并发布为预发布版本，避免并发或重跑覆盖附件。
+Release 附件：
+    gpu-check-arm64-v8a-debug.apk：调试签名，可直接安装；不同运行使用临时调试证书，可能需要先卸载旧包再安装。
+    gpu-check-arm64-v8a-release-unsigned.apk：未签名的 Release APK，安装前需要使用自己的证书签名。
+    SHA256SUMS.txt：两个 APK 的 SHA-256 校验值。
+发布使用工作流内置的 GITHUB_TOKEN（contents: write），不需要额外配置发布令牌。
+下载地址：https://github.com/enenH/gpu-check/releases
+
 纯 Java 规则测试
     .\scripts\test-policy.ps1
     .\scripts\test-avc.ps1
