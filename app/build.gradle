@@ -8,8 +8,8 @@ android {
         applicationId 'com.gpucheck.app'
         minSdk 26
         targetSdk 35
-        versionCode 11
-        versionName '1.4.1'
+        versionCode 13
+        versionName '1.5.1'
         testInstrumentationRunner project.findProperty('gpuCheckTestRunner') ?: 'com.gpucheck.app.SelfGpuInstrumentation'
         ndk { abiFilters 'arm64-v8a' }
     }
@@ -57,4 +57,22 @@ tasks.register('compileSelfGpu', Exec) {
     }
 }
 
-tasks.named('preBuild').configure { dependsOn 'compileProbe', 'compileSelfGpu' }
+def layerOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_layer.so')
+tasks.register('compileLayerBinder', Exec) {
+    def source = rootProject.file('native/layer_binder.cpp')
+    inputs.file(source)
+    outputs.file(layerOutput)
+    doFirst {
+        def output = layerOutput.get().asFile
+        output.parentFile.mkdirs()
+        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
+        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
+        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+                '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
+                source.absolutePath, '-ldl', '-o', output.absolutePath
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn 'compileProbe', 'compileSelfGpu', 'compileLayerBinder' }

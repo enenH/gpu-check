@@ -57,6 +57,10 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
     private int nonemptyUiSnapshots;
     private int maximumUiCandidates;
     private String installedVersion;
+    private View overlayFixture;
+    private String overlayFixtureName;
+    private long fixtureHitAt, fixtureRemovedAt;
+    private boolean fixtureGoneObserved;
 
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
@@ -79,9 +83,16 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                     .put("expectedTargetPid", expectedTargetPid).put("appUid", android.os.Process.myUid())
                     .put("appPid", android.os.Process.myPid()).put("installedVersion", installedVersion)
                     .put("startedEpochMs", System.currentTimeMillis());
+            summary.put("appSelinux", new String(Files.readAllBytes(new File("/proc/self/attr/current").toPath()), StandardCharsets.UTF_8)
+                    .replace("\u0000", "").trim());
+            String ownStatus = new String(Files.readAllBytes(new File("/proc/self/status").toPath()), StandardCharsets.UTF_8);
+            for (String statusLine : ownStatus.split("\n")) {
+                if (statusLine.startsWith("CapEff:")) summary.put("appCapEff", statusLine.substring(7).trim());
+            }
             check(android.os.Process.myUid() >= 10000, "Instrumentation must run as an ordinary App UID");
             check(getTargetContext().getSystemService(PowerManager.class).isInteractive(), "Screen is not awake");
             check(!getTargetContext().getSystemService(KeyguardManager.class).isKeyguardLocked(), "Screen is locked");
+            summary.put("overlayProtocolRegression", OverlayBinderChecks.run());
             reports = Files.newBufferedWriter(new File(files, "service-real.jsonl").toPath(), StandardCharsets.UTF_8);
             uiReports = Files.newBufferedWriter(new File(files, "service-ui.jsonl").toPath(), StandardCharsets.UTF_8);
             Activity launched = startActivitySync(new Intent(getTargetContext(), MainActivity.class)
@@ -90,6 +101,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             activity = (MainActivity) launched;
             waitForIdleSync();
             check(!MonitorService.running && MonitorService.latestReport == null, "Unexpected retained session before start");
+            if (Boolean.parseBoolean(arguments.getString("overlay_fixture", "false"))) createOverlayFixture();
             clickStartStop();
             JSONObject first = awaitSamples("first", 2, 20000);
             int firstCollector = first.getInt("collectorPid");
@@ -107,11 +119,35 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             while (SystemClock.elapsedRealtime() < deadline) {
                 check(MonitorService.running, "Service stopped during real capture: " + MonitorService.lastError);
                 recordLatest("first");
+                advanceOverlayFixture();
                 SystemClock.sleep(50);
             }
             recordLatest("first");
+            if (overlayFixtureName != null) {
+                check(fixtureHitAt > 0, "Real ZUI collection did not find the app-owned fixture window");
+                check(fixtureGoneObserved, "A fresh ZUI collection did not confirm fixture disappearance");
+                summary.put("overlayFixtureLifecyclePassed", true);
+            }
             screenshot("service-ui-active.png");
             summary.put("activeUi", captureUi());
+            onMain(() -> check(((View) field("overlayCard")).performClick(), "Overlay evidence card did not open"));
+            waitForIdleSync();
+            long dialogDeadline = SystemClock.elapsedRealtime() + 3000;
+            boolean dialogVisible = false;
+            while (SystemClock.elapsedRealtime() < dialogDeadline) {
+                android.view.accessibility.AccessibilityNodeInfo root = getUiAutomation().getRootInActiveWindow();
+                if (root != null && !root.findAccessibilityNodeInfosByText("悬浮窗检测依据").isEmpty()) {
+                    dialogVisible = true;
+                    break;
+                }
+                SystemClock.sleep(50);
+            }
+            check(dialogVisible, "Overlay evidence dialog is not visible");
+            SystemClock.sleep(250); // Let the dialog's first rendered frame reach screenshot capture.
+            screenshot("overlay-details.png");
+            check(getUiAutomation().performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK), "Cannot close overlay details");
+            waitForIdleSync();
+            check(MonitorService.running, "Opening overlay details stopped collection");
             if (expectedTargetPid > 0) {
                 validation(expectedTargetObservations > 0, "expected_target_not_observed",
                         "External validation PID did not appear in the real monitored list");
@@ -140,6 +176,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             result.putString("result", "FAIL");
             result.putString("error", detail);
         } finally {
+            try { removeOverlayFixture(); } catch (Exception ignored) { }
             if (MonitorService.running) {
                 try { getTargetContext().stopService(new Intent(getTargetContext(), MonitorService.class)); }
                 catch (Exception ignored) { }
@@ -240,6 +277,16 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         validation("SAMPLING".equals(report.optString("samplingState")), "missing_sampling_state",
                 "Real report does not state SAMPLING");
         JSONArray rows = report.getJSONArray("processes");
+        JSONObject overlay = report.getJSONObject("overlay");
+        observeOverlayFixture(overlay);
+        validation(!overlay.optBoolean("brandGateUsed") && overlay.getJSONArray("routes").length() == 3,
+                "overlay_routes_missing", "Every ROM route must be represented without a brand gate");
+        for (int i = 0; i < overlay.getJSONArray("routes").length(); i++) {
+            JSONObject route = overlay.getJSONArray("routes").getJSONObject(i);
+            validation(route.getInt("appUid") == android.os.Process.myUid(), "overlay_uid", "Layer query changed UID");
+            validation(!"STALE".equals(route.optString("status")) || "AVAILABLE".equals(route.optString("previousStatus")),
+                    "overlay_unavailable_became_stale", "Unavailable protocol was misclassified as stale layer data");
+        }
         CgroupWatchInstrumentation.assertSelfExcluded(report, -1);
         List<Integer> expectedOrder = validateReportOrder(rows);
         JSONObject frame = new JSONObject().put("phase", phase).put("collectorPid", report.getInt("collectorPid"))
@@ -266,6 +313,82 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         frame.put("ui", ui);
         frames.put(frame);
         return report;
+    }
+
+    /** A real app-owned panel, not mock detector input; no SYSTEM_ALERT_WINDOW permission. */
+    private void createOverlayFixture() throws Exception {
+        overlayFixtureName = "gpc_fixture_" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        onMain(() -> {
+            TextView panel = new TextView(activity);
+            panel.setText("悬浮窗检测测试");
+            panel.setTextColor(android.graphics.Color.BLACK);
+            panel.setTextSize(16);
+            panel.setBackgroundColor(android.graphics.Color.CYAN);
+            panel.setGravity(android.view.Gravity.CENTER);
+            float density = activity.getResources().getDisplayMetrics().density;
+            android.view.WindowManager.LayoutParams params = new android.view.WindowManager.LayoutParams(
+                    (int) (190 * density), (int) (52 * density), android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                    android.graphics.PixelFormat.TRANSLUCENT);
+            params.token = activity.getWindow().getDecorView().getWindowToken();
+            params.gravity = android.view.Gravity.TOP | android.view.Gravity.RIGHT;
+            params.setTitle(overlayFixtureName);
+            activity.getWindowManager().addView(panel, params);
+            overlayFixture = panel;
+        });
+        summary.put("overlayFixture", new JSONObject().put("name", overlayFixtureName).put("syntheticReport", false)
+                .put("kind", "real_app_owned_application_panel").put("expectedOwnerUid", android.os.Process.myUid())
+                .put("targetNameSuppliedToDetector", false));
+        Files.write(new File(files, "overlay-fixture.json").toPath(), summary.getJSONObject("overlayFixture").toString(2).getBytes(StandardCharsets.UTF_8));
+        Bundle ready = new Bundle(); ready.putString("stage", "OVERLAY_FIXTURE_CREATED");
+        ready.putString("fixtureName", overlayFixtureName); sendStatus(0, ready);
+    }
+
+    private void observeOverlayFixture(JSONObject overlay) throws Exception {
+        if (overlayFixtureName == null) return;
+        JSONArray routes = overlay.getJSONArray("routes");
+        for (int i = 0; i < routes.length(); i++) {
+            JSONObject route = routes.getJSONObject(i);
+            if (!"zui".equals(route.optString("route")) || !route.optBoolean("available")) continue;
+            boolean found = false;
+            JSONArray rows = route.getJSONArray("rows");
+            for (int j = 0; j < rows.length(); j++) {
+                JSONObject row = rows.getJSONObject(j);
+                if (!overlayFixtureName.equals(row.optString("normalizedName"))) continue;
+                found = true;
+                check(row.optBoolean("suspicious"), "Unexplained fixture title was not classified as suspicious");
+                if (fixtureHitAt == 0) {
+                    fixtureHitAt = SystemClock.elapsedRealtime();
+                    summary.getJSONObject("overlayFixture").put("firstHit", row).put("firstHitAtMs", fixtureHitAt)
+                            .put("firstCollectionAtMs", route.getLong("observedAtMs"));
+                    Bundle hit = new Bundle(); hit.putString("stage", "OVERLAY_FIXTURE_DETECTED"); sendStatus(0, hit);
+                }
+            }
+            if (fixtureRemovedAt > 0 && route.optLong("observedAtMs") > fixtureRemovedAt && !found && !fixtureGoneObserved) {
+                fixtureGoneObserved = true;
+                summary.getJSONObject("overlayFixture").put("absenceCollectionAtMs", route.getLong("observedAtMs"))
+                        .put("absentFromFreshCollection", true);
+                Bundle gone = new Bundle(); gone.putString("stage", "OVERLAY_FIXTURE_DISAPPEARED"); sendStatus(0, gone);
+            }
+        }
+    }
+
+    private void advanceOverlayFixture() throws Exception {
+        if (overlayFixture == null || fixtureHitAt == 0 || SystemClock.elapsedRealtime() - fixtureHitAt < 2500) return;
+        JSONObject ui = captureUi();
+        check(ui.optBoolean("overlaySuspected") && "外挂悬浮窗".equals(ui.optString("overlayStatus")), "Fixture did not reach real red UI");
+        check(ui.optString("overlayNames").contains(overlayFixtureName), "Real UI does not show the fixture name");
+        summary.getJSONObject("overlayFixture").put("hitUi", ui);
+        screenshot("overlay-fixture-hit.png");
+        removeOverlayFixture();
+        fixtureRemovedAt = SystemClock.elapsedRealtime();
+        summary.getJSONObject("overlayFixture").put("removedAtMs", fixtureRemovedAt);
+        Bundle removed = new Bundle(); removed.putString("stage", "OVERLAY_FIXTURE_REMOVED"); sendStatus(0, removed);
+    }
+
+    private void removeOverlayFixture() throws Exception {
+        if (overlayFixture == null) return;
+        onMain(() -> { activity.getWindowManager().removeViewImmediate(overlayFixture); overlayFixture = null; });
     }
 
     private List<Integer> validateReportOrder(JSONArray rows) throws Exception {
@@ -312,11 +435,22 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             if (order.length() > 0) nonemptyUiSnapshots++;
             maximumUiCandidates = Math.max(maximumUiCandidates, order.length());
             TextView errors = (TextView) field("errorText");
+            TextView overlayLabel = (TextView) field("overlayStatus");
+            TextView overlayNames = (TextView) field("overlayNames");
+            JSONObject overlay = shown == null ? null : shown.optJSONObject("overlay");
+            boolean suspected = overlay != null && overlay.optBoolean("suspected");
+            validation("外挂悬浮窗".contentEquals(overlayLabel.getText()) == suspected,
+                    "overlay_label", "Overlay label does not match the displayed report");
+            if (suspected) validation(overlayLabel.getCurrentTextColor() == android.graphics.Color.rgb(255, 119, 125)
+                            && overlayNames.getVisibility() == View.VISIBLE && overlayNames.length() > 0,
+                    "overlay_red", "Overlay alert is not red or lacks names");
             result.set(new JSONObject().put("renderedReportPresent", shown != null)
                     .put("hasRealSample", shown != null && shown.has("sampleIndex"))
                     .put("sampleIndex", shown == null ? -1 : shown.optLong("sampleIndex", -1))
                     .put("collectorPid", shown == null ? -1 : shown.optInt("collectorPid", -1))
                     .put("heroStatus", ((TextView) field("heroStatus")).getText().toString())
+                    .put("overlayStatus", overlayLabel.getText().toString()).put("overlayColor", overlayLabel.getCurrentTextColor())
+                    .put("overlayNames", overlayNames.getText().toString()).put("overlaySuspected", suspected)
                     .put("button", ((Button) field("startButton")).getText().toString())
                     .put("visibleErrors", errors.getVisibility() == View.VISIBLE ? errors.getText().toString() : "")
                     .put("listText", allText(list)).put("pidOrder", order)

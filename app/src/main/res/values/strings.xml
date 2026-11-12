@@ -33,6 +33,7 @@
     <string name="environment_conflict_details">点击查看 pidfd / stat 原始依据</string>
     <string name="lifecycle_association_line">进程启停关联 · %1$s</string>
     <string name="gpu_overlay_confirmed">确认使用gpu悬浮窗</string>
+    <string name="overlay_cheat">外挂悬浮窗</string>
     <string name="lifecycle_onset_ambiguous">多个进程或槽同步，时序关联有歧义</string>
     <string name="lifecycle_pending">观察出现时序中</string>
     <string name="lifecycle_no_evidence">未观察到生命周期关联</string>

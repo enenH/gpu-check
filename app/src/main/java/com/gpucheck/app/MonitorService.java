@@ -32,6 +32,7 @@ public final class MonitorService extends Service {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private volatile Process process;
     private volatile AvcEvidence avcEvidence;
+    private volatile OverlayMonitor overlayMonitor;
     private volatile int generation;
     private volatile long lastOutputAt;
     private volatile boolean receivedSample;
@@ -77,6 +78,8 @@ public final class MonitorService extends Service {
         lastOutputAt = SystemClock.uptimeMillis();
         receivedSample = false;
         final double configuredThreshold = threshold;
+        OverlayMonitor sessionOverlay = new OverlayMonitor(this);
+        overlayMonitor = sessionOverlay;
         try {
             JSONObject initial = new JSONObject();
             initial.put("schema", 1).put("root", false).put("mode", "unprivileged")
@@ -84,6 +87,7 @@ public final class MonitorService extends Service {
                     .put("timestampEpochMs", System.currentTimeMillis()).put("threshold", threshold)
                     .put("windows", windows).put("intervalMs", interval).put("highRiskCount", 0)
                     .put("processes", new JSONArray())
+                    .put("overlay", sessionOverlay.snapshot())
                     .put("errors", new JSONArray());
             publish(initial, token);
         } catch (Exception e) { Log.e("GpuCheck", "Initial report", e); }
@@ -146,6 +150,8 @@ public final class MonitorService extends Service {
                     SelfGpuSlots.enrich(raw);
                     localEvidence.enrich(raw);
                     JSONObject report = engine.process(raw);
+                    OverlayMonitor overlay = overlayMonitor;
+                    if (overlay != null && token == generation) report.put("overlay", overlay.snapshot());
                     publish(report, token);
                     if (raw.optBoolean("root")) throw new IllegalStateException("采集器意外拥有 root 权限，已停止；本应用仅使用普通应用权限。");
                 }
@@ -186,6 +192,9 @@ public final class MonitorService extends Service {
         AvcEvidence evidence = avcEvidence;
         avcEvidence = null;
         if (evidence != null) evidence.stop();
+        OverlayMonitor overlay = overlayMonitor;
+        overlayMonitor = null;
+        if (overlay != null) overlay.close();
         latestReport = null;
         lastError = error == null ? null : status + "\n" + error;
         stopSelf();

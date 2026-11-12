@@ -3,6 +3,7 @@ GPU Check — Android 用户态进程风险检测
 权限边界
 应用及其原生采集器以普通应用 UID 运行，不调用 su，不使用 adb/Shizuku/root 辅助服务，不启动测试目标。
 Manifest 不声明任何权限；不申请通知、存储或读取全设备日志权限。
+仅声明 com.zui.SecretCode 的包可见性查询，不按机型或品牌属性跳过悬浮窗检测路线。
 仅在检测界面可见期间采样，离开界面自动停止。无前台服务或通知。
 
 检测方式
@@ -45,6 +46,26 @@ Manifest 不声明任何权限；不申请通知、存储或读取全设备日�
    排除当前及上一轮成功查询的自身槽，逐轮更新，避免槽号复用后永久屏蔽；查询缺失、不完整或过期时暂停高频提示。
    高频报告包含 selfGpuSlots 查询证据及 selfSlotsExcluded 名单；原始 memstore 数据和进程生命周期关联保持各自语义。
    这是整机槽位活动提示，速率单位是计数增量/秒，不是实测帧率；不分配给具体 PID，也不增加进程高风险数。
+8. 悬浮窗名称检测：每次开始检测均实际探测 layerinfo 中的 Oplus（一加/OPPO/realme）、红魔/Nubia、联想/ZUI 三条路线。
+   不读取 Build.BRAND、MANUFACTURER、MODEL 或 ROM 属性决定是否调用；机型字段只用于原有设备信息展示。
+   Oplus：普通 App JNI 取得 SurfaceFlinger，校验 android.ui.ISurfaceComposer，调用 0x6f696665 查询 String16 名称。
+   每轮最多256次名称查询，通用片段及字符搜索不接收外部目标名；有界扩展队列跨轮继续，之前可疑名称每轮重新查询。
+   轮换查询数字与非十六进制字母的组合，减少正常窗口随机hash遮住单字符搜索时的漏检；该字符表不含目标名称。
+   前后唯一不存在查询必须为空，非空回复必须包含查询子串；严格验证长度、终止符、Unicode及尾余，异常回复不当成名称。
+   红魔/Nubia：分别实际尝试交易77和73的 list_layer，按恢复代码写入UTF-8 String8（不是Java writeString）。
+   校验String8回复并按行解析名称；不需要改变 select_layer 诊断选择或执行 latency_layer 才能判断名称。
+   联想/ZUI：检查真实 BootCompleteReceiver 的可调用性，发送初始化和 collectlog 广播，在本应用独占的外部文件目录接收日志。
+   每次最多等待30秒，同一检测会话完成后至少60秒才再次触发，跨会话也有60秒请求冷却；仅解析 SurfaceFlinger 文本，限制2MiB，完成后清理本次临时目录。
+   厂商 collectlog 自身还会清理/移动部分诊断文件（/data/misc/*.hprof、iplog、dumpsys临时目录），不是纯只读系统调用；应用不直接操作这些路径。
+   停止后不再发布结果；已经提交的厂商日志请求可能继续完成，后台只等待收尾并清理本次目录。
+   三条路线各有独立且全App限额的工作线程，同步Binder超时不会阻塞CPU监听或产生无限新线程；旧结果到期后标为不可用。
+   名称含可疑绘制关键词，或无法解释为已知系统结构/应用组件格式时，首次命中即在顶部以红色显示“外挂悬浮窗”。
+   仅有#编号、去掉包装后没有实际名称的记录表示名称缺失，不把图层编号当成未知悬浮窗名称；真实的未知名称仍立即标红。
+   展示原始名称与原因，包装图层按规范化名称去重；不是等待CPU/GPU组合条件，也不虚增原有进程高风险数。
+   已知名称仅是格式解释，不是经过认证的白名单；名字可伪装，未知名称也可能属于正常软件，结论属于用户指定的名称启发式。
+   Oplus/Nubia名称回复不含PID/UID，#后缀不是PID；ZUI仅在同一份dump中用完整名称精确连接明确的pid/uid字段。
+   原始报告的overlay.routes保留实际响应状态、查询证据、范围及时间；接口缺失、拒绝、畸形回复、超时和未发现名称分别记录。
+   子串枚举与文本解析均有覆盖范围限制；其他路线不可用时不会显示“安全”或当作已扫描全部图层。
 
 界面
 开始/停止检测；查看全进程CPU排行和进程详情。风险规则使用内部默认阈值，CPU监听本身不设最低负载。
@@ -89,7 +110,17 @@ Release 附件：
     .\scripts\test-gpu-frequency.ps1
     .\scripts\test-self-gpu.ps1
     .\scripts\test-cgroup-watch.ps1
+    .\scripts\test-overlay.ps1
 测试产物在 build 下对应的 *-tests 目录，不需要 Android 设备。
+
+联想/ZUI悬浮窗真机回归
+    .\gradlew.bat assembleDebug assembleDebugAndroidTest lintDebug '-PgpuCheckTestRunner=com.gpucheck.app.ServiceDeviceInstrumentation' --no-daemon
+    python -X utf8 scripts/test-overlay-lenovo.py --serial SERIAL --seconds 110
+测试APK创建真实的普通应用附属窗口，并检查：实际ZUI采集命中随机标题、页面红字与标题、移除窗口后下一轮新采集不再返回该标题。
+随机标题只用于创建窗口和测试断言，不传给正式检测器；不需要SYSTEM_ALERT_WINDOW。目标窗口与测试APK代码不随正式APK发布。
+脚本保存窗口存在/消失时独立ADB SurfaceFlinger记录；当前ZUI禁用run-as，因此主机侧su仅用于取回测试回执和检查临时目录。
+App本身保持普通UID、untrusted_app、CapEff=0，无清单权限，不以这些外部记录参与检测。
+未开启overlay_fixture参数时，ServiceDeviceInstrumentation沿用普通Service/UI回归，不创建任何测试窗口。
 
 cgroup路径候选真机回归（仅测试APK包含模拟数据）
     .\gradlew.bat assembleDebug assembleDebugAndroidTest lintDebug '-PgpuCheckTestRunner=com.gpucheck.app.CgroupWatchInstrumentation' --no-daemon
@@ -111,6 +142,28 @@ cgroup路径候选真机回归（仅测试APK包含模拟数据）
 EGL 负载和检测器在测试结束时清理；负载代码仅在独立测试 APK 中，正式 APK 不包含。
 2026-10-28：10轮完整查询，识别2个自身槽，单轮最长3ms，自身高频5轮被排除，模拟外部对照5轮命中。
 记录：build\self-gpu-device-test\result.txt。
+
+联想/ZUI真机验收（2026-11-12，1.5.1）
+TB322FC、Android16：正式检测器以UID10274/untrusted_app/CapEff=0完成真实ZUI采集；三条ROM路线仍全部实际探测。
+首轮54份采样通过，两次ZUI采集各14个图层、约15秒完成且临时文件清理成功；修复只有#55编号、无实际名称的系统容器误报。
+修正版59份采样和真实窗口生命周期验证通过：测试APK创建gpc_fixture_d9699138b268窗口，正式检测器自主命中并红字显示。
+同一dump精确解析其PID14067/UID10274；独立SurfaceFlinger记录确认同名窗口，移除后新一轮采集不再返回该标题。
+该窗口为实际渲染的应用附属测试窗口，不是DFM实例，也不是向检测器注入模拟JSON或目标名；窗口及测试代码仅在测试APK中。
+停止、重启、切后台清理通过；80项主机规则检查、22项协议检查、Debug/Release构建及Lint通过。
+当前固件禁用run-as，主机su仅用于回执导出和目录核验，App未增加权限；无线ADB导出曾出现退出码255，App内PASS回执单独保留。
+证据：build\overlay-lenovo-device-test\initial及fixture；安装包：dist\GpuCheck.apk。
+
+悬浮窗名称检测验收（2026-11-12，1.5.0）
+Oplus、红魔/Nubia、联想/ZUI均已实现实际能力探测；不按品牌、型号或ROM属性跳过。
+CPH2415普通App UID10056实测自主命中6frfg88tb3tj#594，顶部红字“外挂悬浮窗”和名称、依据弹窗均核验。
+三路真实结果：Oplus可用；红魔77被拒绝、73回复不兼容；ZUI组件不存在。这不是对其他ROM成功调用的真机声明。
+最终16份正式Service报告、真实View红字检查、停止/重启/切后台清理通过；Oplus每轮最多256次名称查询，本轮最长264ms。
+76项主机规则/解码检查、22项测试APK协议检查及原有Java规则回归通过；协议检查含单字符被正常图层遮挡、组合搜索与目标消失。
+原Oplus33个名称回放仅随机目标名命中；原ZUI实机dump回放解析16个名称，悬浮窗及其明确pid/uid精确核对通过，属于离线回放。
+Debug/Release构建和Lint通过（0错误，含受控ServiceManager反射回退的兼容性警告）；设备安装包与dist/GpuCheck.apk的SHA-256一致。
+原始String16回复另经主机独立解码，与独立ADB SurfaceFlinger记录核对；外部目标名和PID没有传给检测器。
+完整记录：build\overlay-device-test\delivery；回归修复前的遮挡记录：build\overlay-device-test\masked-before。
+当前安装包：dist\GpuCheck.apk；截图：dist\overlay-evidence.png；验证回执：dist\overlay-verification.json。
 
 自身进程与线程排除验收（2026-11-12，1.4.1）
 CPU采集前后动态枚举本应用、采集器、同UID进程及其task/TID，排除样本、基线和生命周期事件；Java处理与UI另按App PID、采集器PID、UID过滤。
@@ -178,6 +231,10 @@ scripts/test-live-service.py 在正式界面建立基线后启动有界CPU负载
 脚本使用的测试二进制在 build/live-device-test/bin，源码在 tests/device，不随正式APK发布。
 
 资料
+悬浮窗协议来源：D:\libDump\12\dfm\mrcps\MRPCS\as\android_probe\layerinfo.md；
+同目录 work\dfm-overlay-oneplus-20261112（Oplus实机源码/回复）、work\dfm-overlay-20261112（ZUI实机源码/dump）；
+原DEX注释：D:\libDump\12\dfm\mrcps\v4\mrpcs_as_analysis\deep34\evidence\activity\oem_bridge.annotated.txt。
+红魔 V.A/V.D/V.s/V.u 对应只读取名的 String8 list_layer 路线，两个固定交易号来自 V.<clinit>。
 自身槽过滤方法依据：C:\Users\ITEK\Downloads\MRPCS\cp\KGSL_ENGINE_DEEP_ANALYSIS.html（当前进程已有fd与READTIMESTAMP owner检查）。
 用户提供的两份 SG81 报告用于 CPU 时钟采样与证据边界分析；MRPCS 实验用于 GPU 观察和归属校验。
 SG81 材料不提供已证实的通用高风险阈值。仅加载 EGL/GLES 库或观察到全局 GPU 计数不能证明某 PID 使用 GPU。

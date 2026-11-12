@@ -61,6 +61,9 @@ public final class MainActivity extends Activity {
     private TextView globalGpuStatus;
     private TextView environmentSummary;
     private TextView recentLifecycleSignals;
+    private TextView overlayStatus;
+    private TextView overlayNames;
+    private LinearLayout overlayCard;
     private Button startButton;
     private LinearLayout processList;
     private final List<ProcessRow> processRows = new ArrayList<>();
@@ -118,6 +121,7 @@ public final class MainActivity extends Activity {
             renderedReport = null;
             lastRenderedSnapshot = null;
             clearProcessRows();
+            updateOverlayStatus();
         }
         super.onStop();
     }
@@ -156,6 +160,17 @@ public final class MainActivity extends Activity {
         marginAdd(page, title, 12);
         TextView subtitle = label("排除自身进程与线程 · 显示 CPU 前 10", 13, MUTED, false);
         marginAdd(page, subtitle, 6);
+
+        overlayCard = card();
+        overlayStatus = label("悬浮窗检测 · 等待开始", 18, MUTED, true);
+        overlayNames = label("", 12, TEXT, false);
+        overlayNames.setLineSpacing(dp(3), 1f);
+        overlayNames.setVisibility(View.GONE);
+        overlayCard.addView(overlayStatus);
+        marginAdd(overlayCard, overlayNames, 6);
+        overlayCard.setOnClickListener(v -> showOverlayEvidence());
+        overlayCard.setFocusable(true);
+        marginAdd(page, overlayCard, 16);
 
         hero = card();
         marginAdd(page, hero, 22);
@@ -276,6 +291,7 @@ public final class MainActivity extends Activity {
         if (raw == null || raw.isEmpty()) {
             currentReport = null;
             renderedReport = null;
+            updateOverlayStatus();
             updateEnvironmentStatus();
             updateRecentLifecycleSignals();
             watchSummary.setText(getString(R.string.monitoring_summary, 0, 0, 0));
@@ -298,6 +314,7 @@ public final class MainActivity extends Activity {
         }
         try {
             currentReport = new JSONObject(raw);
+            updateOverlayStatus();
             updateEnvironmentStatus();
             updateRecentLifecycleSignals();
             if (running && isStartingReport()) {
@@ -413,6 +430,8 @@ public final class MainActivity extends Activity {
                 renderProcesses();
             }
         } catch (JSONException e) {
+            currentReport = null;
+            updateOverlayStatus();
             environmentCard.setVisibility(View.GONE);
             environmentSummary.setText("");
             recentLifecycleSignals.setVisibility(View.GONE);
@@ -428,6 +447,92 @@ public final class MainActivity extends Activity {
         JSONObject scan = cgroupPathScan();
         return !isStartingReport() && scan != null
                 && (!scan.optBoolean("available") || !scan.optBoolean("calibrationValid"));
+    }
+
+    private void updateOverlayStatus() {
+        JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
+        boolean suspicious = overlay != null && overlay.optBoolean("suspected");
+        overlayStatus.setTextColor(suspicious ? RED : MUTED);
+        overlayCard.setBackground(shape(suspicious ? Color.rgb(43, 30, 35) : SURFACE, suspicious ? RED : BORDER, 16));
+        overlayNames.setText("");
+        overlayNames.setVisibility(View.GONE);
+        if (suspicious) {
+            overlayStatus.setText(R.string.overlay_cheat);
+            JSONArray names = overlay.optJSONArray("suspects");
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; names != null && i < Math.min(3, names.length()); i++) {
+                JSONObject row = names.optJSONObject(i);
+                if (row == null) continue;
+                if (text.length() > 0) text.append('\n');
+                text.append(displayLayerName(row.optString("name")));
+            }
+            if (names != null && names.length() > 3) text.append("\n另有 ").append(names.length() - 3).append(" 个可疑名称");
+            text.append("\n点击查看名称与判断依据");
+            overlayNames.setText(text);
+            overlayNames.setVisibility(View.VISIBLE);
+        } else if (!MonitorService.running) overlayStatus.setText("悬浮窗检测 · 等待开始");
+        else if (overlay == null) overlayStatus.setText("悬浮窗检测 · 正在探测");
+        else if (overlay.optInt("availableRoutes") > 0) overlayStatus.setText("悬浮窗检测 · 暂未发现可疑名称");
+        else {
+            boolean checking = false;
+            JSONArray routes = overlay.optJSONArray("routes");
+            for (int i = 0; routes != null && i < routes.length(); i++) {
+                JSONObject route = routes.optJSONObject(i);
+                if (route != null && "CHECKING".equals(route.optString("status"))) checking = true;
+            }
+            overlayStatus.setText(checking ? "悬浮窗检测 · 正在探测" : "悬浮窗检测 · 本轮未取得图层数据");
+        }
+    }
+
+    private static String displayLayerName(String name) {
+        String safe = name.replaceAll("[\\p{Cntrl}\\p{Cf}]", "�");
+        return safe.length() > 180 ? safe.substring(0, 180) + "…" : safe;
+    }
+
+    private void showOverlayEvidence() {
+        JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
+        if (overlay == null) return;
+        StringBuilder detail = new StringBuilder("对可疑或无法解释的名称立即提示。名称判断属于启发式，未命中不代表没有悬浮窗。\n\n");
+        JSONArray routes = overlay.optJSONArray("routes");
+        for (int i = 0; routes != null && i < routes.length(); i++) {
+            JSONObject route = routes.optJSONObject(i);
+            if (route == null) continue;
+            String id = route.optString("route");
+            detail.append("oplus".equals(id) ? "Oplus / 一加 / OPPO / realme" : "nubia".equals(id) ? "红魔 / Nubia" : "联想 / ZUI")
+                    .append("：").append(overlayRouteState(route.optString("status"))).append('\n');
+            if (!route.optString("error").isEmpty()) detail.append(route.optString("error")).append('\n');
+        }
+        detail.append("\n三条路线均按实际接口响应判断，不按机型或品牌跳过。扫描有覆盖范围限制。\n");
+        JSONArray suspects = overlay.optJSONArray("suspects");
+        for (int i = 0; suspects != null && i < suspects.length(); i++) {
+            JSONObject row = suspects.optJSONObject(i);
+            if (row == null) continue;
+            detail.append('\n').append(displayLayerName(row.optString("name"))).append('\n')
+                    .append(row.optString("reason")).append('\n');
+            if (!row.isNull("ownerPid")) detail.append("图层记录中的 PID：").append(row.optInt("ownerPid"))
+                    .append(" / UID：").append(row.optInt("ownerUid")).append('\n');
+            else detail.append("接口未提供 PID / UID；# 后缀为图层编号。\n");
+        }
+        TextView text = label(detail.toString(), 13, TEXT, false);
+        text.setTextIsSelectable(true);
+        text.setPadding(dp(22), dp(16), dp(22), dp(20));
+        ScrollView scroll = new ScrollView(this); scroll.addView(text);
+        new AlertDialog.Builder(this).setTitle("悬浮窗检测依据").setView(scroll).setPositiveButton("关闭", null).show();
+    }
+
+    private static String overlayRouteState(String state) {
+        switch (state) {
+            case "AVAILABLE": return "已取得图层名称";
+            case "CHECKING": return "正在探测";
+            case "UNSUPPORTED": return "接口不可用";
+            case "BLOCKED": return "访问被拒绝";
+            case "NO_DATA": return "接口未返回图层名称";
+            case "TIMEOUT": return "查询超时";
+            case "STALE": return "数据已过期";
+            case "CANCELLED": return "已停止";
+            case "COOLDOWN": return "等待下一轮日志收集";
+            default: return "回复校验失败";
+        }
     }
 
     private boolean isCgroupPathProbeAvailable() {
