@@ -36,7 +36,7 @@ import java.util.Objects;
 
 /** A local-only dashboard. Every risk label comes from the monitor's measured report. */
 public final class MainActivity extends Activity {
-    private static final double MIN_VISIBLE_CPU_PERCENT = 0.2;
+    static final int MAX_DISPLAYED_PROCESSES = 10;
     private static final int BG = Color.rgb(10, 20, 25);
     private static final int SURFACE = Color.rgb(18, 35, 43);
     private static final int BORDER = Color.rgb(38, 65, 74);
@@ -152,9 +152,9 @@ public final class MainActivity extends Activity {
         stateBadge = badge("未运行", MUTED);
         heading.addView(stateBadge);
         page.addView(heading);
-        TextView title = label("后台进程风险检测", 27, TEXT, true);
+        TextView title = label("全进程 CPU 监听", 27, TEXT, true);
         marginAdd(page, title, 12);
-        TextView subtitle = label("无需任何授权 · CPU 负载与 GPU 风险线索", 13, MUTED, false);
+        TextView subtitle = label("排除自身进程与线程 · 显示 CPU 前 10", 13, MUTED, false);
         marginAdd(page, subtitle, 6);
 
         hero = card();
@@ -334,7 +334,7 @@ public final class MainActivity extends Activity {
             if (processes != null) {
                 for (int i = 0; i < processes.length(); i++) {
                     JSONObject p = processes.optJSONObject(i);
-                    if (p == null || !isVisibleProcess(p)) continue;
+                    if (p == null || !isVisibleProcess(p, currentReport.optInt("collectorPid", -1))) continue;
                     monitoredCount++;
                     boolean rootCandidate = isRootCandidate(p);
                     if (rootCandidate) rootCount++;
@@ -374,9 +374,8 @@ public final class MainActivity extends Activity {
                 heroStatus.setText(R.string.root_watch_title);
                 heroDescription.setText(R.string.root_watch_description);
             } else if (monitoredCount == 0) {
-                boolean idle = currentReport.optInt("monitoredProcessCount") > 0;
-                heroStatus.setText(idle ? R.string.no_active_cpu_processes : R.string.no_monitored_candidates);
-                heroDescription.setText(idle ? R.string.low_cpu_hidden_description : R.string.monitored_candidates_description);
+                heroStatus.setText(R.string.no_monitored_candidates);
+                heroDescription.setText(R.string.monitored_candidates_description);
             } else if (baseline) {
                 heroStatus.setText(R.string.cpu_unavailable_title);
                 heroDescription.setText("正在建立基线或当前数据不可读取，采集限制会在下方列出。");
@@ -560,21 +559,10 @@ public final class MainActivity extends Activity {
     private void renderProcesses() {
         if (processList == null) return;
         JSONArray values = currentReport == null ? null : currentReport.optJSONArray("processes");
-        List<JSONObject> visible = new ArrayList<>();
-        if (values != null) {
-            for (int i = 0; i < values.length(); i++) {
-                JSONObject p = values.optJSONObject(i);
-                if (p == null || !isVisibleProcess(p)) continue;
-                visible.add(p);
-            }
-        }
-        Collections.sort(visible, (a, b) -> {
-            int busy = Double.compare(cpuSortValue(b), cpuSortValue(a));
-            if (busy != 0) return busy;
-            return Integer.compare(a.optInt("pid"), b.optInt("pid"));
-        });
+        List<JSONObject> visible = cpuLeaders(values, currentReport == null ? -1 : currentReport.optInt("collectorPid", -1));
         String title = getString(R.string.candidates_title);
-        bindText(listTitle, currentReport == null ? title : getString(R.string.counted_title, title, visible.size()));
+        bindText(listTitle, currentReport == null ? title : getString(R.string.cpu_leaders_title,
+                visible.size(), currentReport.optInt("monitoredProcessCount", values == null ? 0 : values.length())));
         if (visible.isEmpty()) {
             clearProcessRows();
             if (emptyProcessCard == null) {
@@ -584,11 +572,10 @@ public final class MainActivity extends Activity {
                 emptyProcessCard.addView(emptyProcessTitle);
                 marginAdd(emptyProcessCard, emptyProcessDescription, 7);
             }
-            boolean idle = currentReport != null && currentReport.optInt("monitoredProcessCount") > 0;
             bindText(emptyProcessTitle, isStartingReport() ? "正在建立采样基线" : currentReport == null
-                    ? "等待第一份进程快照" : getString(idle ? R.string.no_active_cpu_processes : R.string.no_monitored_candidates));
+                    ? "等待第一份进程快照" : getString(R.string.no_monitored_candidates));
             bindText(emptyProcessDescription, getString(isStartingReport() ? R.string.collector_starting
-                    : idle ? R.string.low_cpu_hidden_description : R.string.monitored_candidates_description));
+                    : R.string.monitored_candidates_description));
             if (emptyProcessCard.getParent() == null) marginAdd(processList, emptyProcessCard, 8);
             return;
         }
@@ -608,6 +595,24 @@ public final class MainActivity extends Activity {
             }
             processRows.get(i).bind(visible.get(i));
         }
+    }
+
+    static List<JSONObject> cpuLeaders(JSONArray values, int collectorPid) {
+        List<JSONObject> visible = new ArrayList<>();
+        if (values != null) {
+            for (int i = 0; i < values.length(); i++) {
+                JSONObject p = values.optJSONObject(i);
+                if (p == null || !isVisibleProcess(p, collectorPid)) continue;
+                visible.add(p);
+            }
+        }
+        Collections.sort(visible, (a, b) -> {
+            int busy = Double.compare(cpuSortValue(b), cpuSortValue(a));
+            if (busy != 0) return busy;
+            return Integer.compare(a.optInt("pid"), b.optInt("pid"));
+        });
+        if (visible.size() > MAX_DISPLAYED_PROCESSES) visible.subList(MAX_DISPLAYED_PROCESSES, visible.size()).clear();
+        return visible;
     }
 
     private void clearProcessRows() {
@@ -709,6 +714,8 @@ public final class MainActivity extends Activity {
             boolean onsetMatch = lifecycle != null && "ONSET_MATCH".equals(lifecycle.optString("state"));
             bindText(lifecycleLine, getString(R.string.lifecycle_association_line, lifecycleSummary(lifecycle)));
             bindColor(lifecycleLine, onsetMatch ? RED : MUTED);
+            int lifecycleVisibility = isRootCandidate(p) || cgroupAnomaly ? View.VISIBLE : View.GONE;
+            if (lifecycleLine.getVisibility() != lifecycleVisibility) lifecycleLine.setVisibility(lifecycleVisibility);
             String reason = avcRisk ? "AVC 指向 root 执行域、CPU 持续高占用且全局 GPU 计数推进，触发组合风险告警。"
                     : cgroupAnomaly && !isRootCandidate(p) ? getString(R.string.cgroup_anomaly_description)
                     : p.optString("reason", "等待进一步采样");
@@ -962,13 +969,11 @@ public final class MainActivity extends Activity {
                 process.optString("avcIdentityToken", ""));
     }
 
-    private boolean isVisibleProcess(JSONObject process) {
-        boolean self = MonitoredProcessFilter.isSelf(process.optInt("pid", -1), process.optInt("uid", -1),
-                currentReport == null ? -1 : currentReport.optInt("collectorPid", -1),
+    private static boolean isVisibleProcess(JSONObject process, int collectorPid) {
+        int pid = process.optInt("pid", -1);
+        boolean self = MonitoredProcessFilter.isSelf(pid, process.optInt("uid", -1), collectorPid,
                 android.os.Process.myPid(), android.os.Process.myUid());
-        double cpu = cpuSortValue(process);
-        return MonitoredProcessFilter.accepts(self, isRootCandidate(process), process.optBoolean("cgroupAnomaly"))
-                && (cpu < 0 || cpu >= MIN_VISIBLE_CPU_PERCENT);
+        return MonitoredProcessFilter.acceptsCpu(pid, self);
     }
 
     private String lifecycleSummary(JSONObject lifecycle) {
@@ -1010,6 +1015,7 @@ public final class MainActivity extends Activity {
     }
 
     private String riskName(String risk) {
+        if ("MONITORING".equals(risk)) return "CPU 监听";
         if ("HIGH".equals(risk)) return "高风险 · 需核查";
         if ("SUSPECT".equals(risk)) return "高风险线索 · 归属待核实";
         if ("WATCH".equals(risk)) return "待观察";

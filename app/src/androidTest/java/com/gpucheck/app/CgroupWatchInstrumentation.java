@@ -26,6 +26,8 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         try {
             check(android.os.Process.myUid() >= 10000, "Tests must run in an ordinary application UID");
             verifyEngine();
+            verifyAllProcessCpu();
+            verifySelfCpuExclusion();
             verifyCollector(result);
             File evidence = new File(getTargetContext().getFilesDir(), "cgroup-feature-controls.json");
             Files.write(evidence.toPath(), new JSONObject().put("synthetic", true)
@@ -59,7 +61,8 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         controls.put(new JSONObject().put("case", "zero_cpu_unknown_uid_admitted").put("report", output));
 
         output = engine.process(frame(3, row(ANOMALY_PID, -1, "held:a", 0, "PRESENT", 3)));
-        check(output.getInt("monitoredProcessCount") == 0, "restored named path left a stale anomaly");
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("cgroupAnomalyCount") == 0,
+                "path recovery must clear the anomaly without stopping CPU monitoring");
         controls.put(new JSONObject().put("case", "named_path_restored").put("report", output));
 
         engine = new RiskEngine(20, 3, 2000);
@@ -73,7 +76,8 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         restricted.getJSONObject("cgroupScan").put("complete", false).put("calibrationValid", false)
                 .put("errno", 13).put("status", "unavailable");
         output = engine.process(restricted);
-        check(output.getInt("monitoredProcessCount") == 0, "EACCES was treated as absence");
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("cgroupAnomalyCount") == 0,
+                "EACCES must clear the anomaly without stopping CPU monitoring");
         controls.put(new JSONObject().put("case", "permission_denial_resets").put("report", output));
         verifyPathEvidence();
 
@@ -101,8 +105,10 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
             JSONObject self = row(ANOMALY_PID, android.os.Process.myUid(), "held:self", 99, "MISSING", sample);
             output = engine.process(frame(sample, self));
         }
-        check(output.getInt("monitoredProcessCount") == 0, "same-UID process not excluded");
-        controls.put(new JSONObject().put("case", "own_uid_excluded").put("report", output));
+        check(output.getInt("monitoredProcessCount") == 0 && output.getInt("cpuSampleCount") == 0
+                        && output.getInt("rootProcessCount") == 0 && output.getInt("cgroupAnomalyCount") == 0,
+                "same-UID process was retained in CPU monitoring");
+        controls.put(new JSONObject().put("case", "own_uid_cpu_excluded").put("report", output));
 
         // A confirmed root HIGH row must not override the user's CPU ordering.
         engine = new RiskEngine(20, 3, 2000);
@@ -162,31 +168,39 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         controls.put(new JSONObject().put("case", "cpu_only_root_missing_sample_removed").put("report", output));
 
         output = engine.process(cpuOnlyFrame(4, rootCpu(ROOT_PID, "held:idle", 0, 30001)));
-        check(output.getInt("monitoredProcessCount") == 0, "expired AVC admitted an idle root");
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("rootProcessCount") == 0,
+                "expired AVC must clear root identity without dropping CPU");
         output = engine.process(cpuOnlyFrame(5, rootCpu(ROOT_PID, "held:idle", 0, 0).put("avcRootDomainHint", false)));
-        check(output.getInt("monitoredProcessCount") == 0, "missing root evidence was replaced by cached identity");
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("rootProcessCount") == 0,
+                "missing root evidence was replaced by cached identity");
         controls.put(new JSONObject().put("case", "cpu_only_avc_expiry_not_extended").put("report", output));
 
         for (JSONObject invalid : new JSONObject[]{
                 rootCpu(ROOT_PID, "held:idle", 0, 0).put("identityVerified", false),
-                rootCpu(ROOT_PID, "held:idle", -1, 0),
-                rootCpu(ROOT_PID, "held:idle", 0, 0).put("avcIdentityToken", "held:different"),
-                rootCpu(ROOT_PID, "held:idle", 0, 0).put("uid", 20001),
-                rootCpu(android.os.Process.myPid(), "held:self", 0, 0)}) {
+                rootCpu(ROOT_PID, "held:idle", -1, 0)}) {
             check(new RiskEngine(20, 3, 2000).process(cpuOnlyFrame(0, invalid)).getInt("monitoredProcessCount") == 0,
-                    "invalid/nonroot/self CPU-only row admitted");
+                    "invalid CPU-only row admitted");
+        }
+        for (JSONObject ordinary : new JSONObject[]{
+                rootCpu(ROOT_PID, "held:idle", 0, 0).put("avcIdentityToken", "held:different"),
+                rootCpu(ROOT_PID, "held:idle", 0, 0).put("uid", 20001)}) {
+            JSONObject cpuReport = new RiskEngine(20, 3, 2000).process(cpuOnlyFrame(0, ordinary));
+            check(cpuReport.getInt("monitoredProcessCount") == 1 && cpuReport.getInt("rootProcessCount") == 0,
+                    "ordinary CPU sample was excluded or promoted to root");
         }
         controls.put(new JSONObject().put("case", "cpu_only_invalid_evidence_rejected").put("passed", true));
 
         JSONObject explicitNonroot = frame(0, row(ROOT_PID, 20001, "held:idle", 0, "PRESENT", 0));
         explicitNonroot.put("cpuSamples", new JSONArray().put(rootCpu(ROOT_PID, "held:idle", 0, 0)));
         output = new RiskEngine(20, 3, 2000).process(explicitNonroot);
-        check(output.getInt("monitoredProcessCount") == 0 && output.getInt("cpuSampleCount") == 0,
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("cpuSampleCount") == 1
+                        && output.getInt("rootProcessCount") == 0,
                 "CPU-only root overrode current nonroot process metadata");
         JSONObject replaced = frame(0, row(ROOT_PID, 20001, "held:new", 0, "PRESENT", 0));
         replaced.put("cpuSamples", new JSONArray().put(rootCpu(ROOT_PID, "held:old", 0, 0)));
         output = new RiskEngine(20, 3, 2000).process(replaced);
-        check(output.getInt("monitoredProcessCount") == 0 && output.getInt("cpuSampleCount") == 0,
+        check(output.getInt("monitoredProcessCount") == 1 && output.getInt("cpuSampleCount") == 1
+                        && "held:new".equals(onlyProcess(output).getString("identityToken")),
                 "CPU-only row overrode a replacement PID identity");
         controls.put(new JSONObject().put("case", "cpu_only_current_process_identity_wins").put("report", output));
 
@@ -213,12 +227,13 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         JSONObject full = frame(0).put("cpuSamples", many).put("matchedCandidates", 0).put("candidatesTruncated", false);
         output = new RiskEngine(20, 3, 2000).process(full);
         JSONArray retained = output.getJSONArray("processes");
-        check(retained.length() == 1024 && output.getInt("returnedCandidates") == 1024
-                        && output.getInt("monitoredProcessCount") == 1024 && output.getInt("rootProcessCount") == 1024
-                        && output.getInt("cpuSampleCount") == 1024 && output.getInt("matchedCandidates") == 1200
-                        && output.getInt("monitoredEligibleCount") == 1200 && output.getInt("monitoredCapacityOmissions") == 176
-                        && output.getBoolean("candidatesTruncated") && output.getBoolean("lifecycleCoverageLimited"),
-                "merged queue violated the 1024 limit or reported inconsistent counts");
+        check(retained.length() == 1200 && output.getInt("returnedCandidates") == 1200
+                        && output.getInt("monitoredProcessCount") == 1200 && output.getInt("rootProcessCount") == 1200
+                        && output.getInt("cpuSampleCount") == 1200 && output.getInt("matchedCandidates") == 1200
+                        && output.getInt("monitoredEligibleCount") == 1200 && output.getInt("monitoredCapacityOmissions") == 0
+                        && !output.getBoolean("candidatesTruncated") && output.getBoolean("lifecycleCoverageLimited")
+                        && output.getInt("lifecycleCapacityOmissions") == 176,
+                "CPU queue was truncated or lifecycle capacity was not reported separately");
         for (int i = 0; i < retained.length(); i++) {
             check(retained.getJSONObject(i).getInt("pid") == 1001199 - i
                             && retained.getJSONObject(i).getDouble("cpuPercent") == 1199 - i,
@@ -275,6 +290,66 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
                         && output.getInt("monitoredCapacityOmissions") == 0,
                 "native candidate truncation was lost when Java had no additional omissions");
         controls.put(new JSONObject().put("case", "native_candidate_truncation_limits_lifecycle").put("report", output));
+    }
+
+    private void verifyAllProcessCpu() throws Exception {
+        JSONObject[] ordinary = new JSONObject[1200];
+        for (int i = 0; i < ordinary.length; i++) {
+            ordinary[i] = row(2000000 + i, 20001, "held:ordinary:" + i, i / 1000.0, "PRESENT", 0);
+        }
+        RiskEngine engine = new RiskEngine(20, 3, 2000);
+        JSONObject output = engine.process(frame(0, ordinary));
+        check(output.getInt("monitoredProcessCount") == 1200 && output.getInt("cpuSampleCount") == 1200,
+                "normal/low/zero CPU processes were filtered or capped");
+        check(output.getInt("rootProcessCount") == 0 && output.getInt("cgroupAnomalyCount") == 0
+                        && output.getInt("highRiskCount") == 0 && !output.getBoolean("lifecycleCoverageLimited")
+                        && output.getInt("lifecycleEligibleCount") == 0,
+                "ordinary CPU monitoring polluted risk/lifecycle scope");
+        check("MONITORING".equals(output.getJSONArray("processes").getJSONObject(0).getString("risk")),
+                "ordinary CPU sample mislabeled as a risk candidate");
+        List<JSONObject> leaders = MainActivity.cpuLeaders(output.getJSONArray("processes"), -1);
+        check(leaders.size() == 10 && leaders.get(0).getInt("pid") == 2001199
+                        && leaders.get(9).getInt("pid") == 2001190, "UI did not choose the global top ten");
+        // A previously idle process outside the displayed ten must immediately enter after a burst.
+        ordinary[0].put("cpuPercent", 150);
+        output = engine.process(frame(1, ordinary));
+        leaders = MainActivity.cpuLeaders(output.getJSONArray("processes"), -1);
+        check(output.getInt("monitoredProcessCount") == 1200 && leaders.size() == 10
+                        && leaders.get(0).getInt("pid") == 2000000 && leaders.get(9).getInt("pid") == 2001191,
+                "an undisplayed process stopped sampling or failed to enter top ten");
+        JSONArray few = new JSONArray().put(row(8, -1, "unknown", -1, "UNKNOWN", 0))
+                .put(row(7, 20001, "idle", 0, "PRESENT", 0))
+                .put(row(6, 20001, "low-b", 0.01, "PRESENT", 0))
+                .put(row(5, 20001, "low-a", 0.01, "PRESENT", 0));
+        leaders = MainActivity.cpuLeaders(few, -1);
+        check(leaders.size() == 4 && leaders.get(0).getInt("pid") == 5 && leaders.get(1).getInt("pid") == 6
+                        && leaders.get(2).getInt("pid") == 7 && leaders.get(3).getInt("pid") == 8,
+                "low/zero/unknown CPU sorting or PID tie break is wrong");
+        check(few.length() == 4 && MainActivity.cpuLeaders(new JSONArray(), -1).isEmpty(), "leader selection changed the report");
+        controls.put(new JSONObject().put("case", "all_process_cpu_and_top_ten").put("passed", true));
+    }
+
+    private void verifySelfCpuExclusion() throws Exception {
+        int collector = 910001, ownUid = android.os.Process.myUid();
+        JSONObject[] self = new JSONObject[]{
+                row(android.os.Process.myPid(), -1, "held:app", 1000, "PRESENT", 0),
+                row(collector, -1, "held:collector", 900, "PRESENT", 0),
+                row(910002, ownUid, "held:shared-uid", 800, "PRESENT", 0),
+                row(910003, ownUid, "held:thread", 700, "PRESENT", 0)};
+        JSONObject report = new RiskEngine(20, 3, 2000).process(frame(0, self).put("collectorPid", collector));
+        check(report.getInt("monitoredProcessCount") == 0 && report.getInt("cpuSampleCount") == 0,
+                "App/collector/shared-UID/thread leaked into CPU output");
+        report = new RiskEngine(20, 3, 2000).process(cpuOnlyFrame(0, self).put("collectorPid", collector));
+        check(report.getInt("monitoredProcessCount") == 0 && report.getInt("cpuSampleCount") == 0,
+                "CPU-only merge resurrected self");
+        JSONArray rows = new JSONArray();
+        for (JSONObject own : self) rows.put(own);
+        for (int i = 0; i < 12; i++) rows.put(row(920000 + i, -1, "held:external:" + i, i, "PRESENT", 0));
+        List<JSONObject> leaders = MainActivity.cpuLeaders(rows, collector);
+        check(leaders.size() == 10 && leaders.get(0).getInt("pid") == 920011
+                        && leaders.get(9).getInt("pid") == 920002 && rows.length() == 16,
+                "UI capped before excluding self or failed to fill the external top ten");
+        controls.put(new JSONObject().put("case", "self_cpu_excluded_at_all_layers").put("passed", true));
     }
 
     private void verifyPathEvidence() throws Exception {
@@ -343,7 +418,23 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
                 .getBoolean("selfTest"), "native self-test failed");
 
         File output = new File(files, "cgroup-real.jsonl");
-        run(binary, output, new File(files, "cgroup-real.err"), "--samples", "5", "--interval-ms", "1000");
+        // A second, independent same-UID process must also be excluded, not just the
+        // collector PID and its App parent. No root shell or external target is used.
+        java.lang.Process sibling = new ProcessBuilder("/system/bin/sh", "-c", "echo $$; exec /system/bin/sleep 20").start();
+        int siblingPid;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(sibling.getInputStream(), StandardCharsets.UTF_8))) {
+            siblingPid = Integer.parseInt(reader.readLine().trim());
+            check(siblingPid > 0 && sibling.isAlive(), "same-UID test process failed to start");
+            String status = new String(Files.readAllBytes(new File("/proc/" + siblingPid + "/status").toPath()), StandardCharsets.UTF_8);
+            check(status.matches("(?s).*\\nUid:\\s+" + android.os.Process.myUid() + "\\s+"
+                    + android.os.Process.myUid() + "\\s+.*"), "test process did not inherit the App UID");
+            run(binary, output, new File(files, "cgroup-real.err"), "--samples", "5", "--interval-ms", "1000");
+            check(sibling.isAlive(), "same-UID test process exited before capture ended");
+        } finally {
+            sibling.destroy();
+            if (!sibling.waitFor(3, TimeUnit.SECONDS)) sibling.destroyForcibly();
+        }
         List<String> lines = Files.readAllLines(output.toPath(), StandardCharsets.UTF_8);
         check(lines.size() == 5, "native sample count differs from requested five");
         RiskEngine engine = new RiskEngine(20, 3, 1000);
@@ -354,6 +445,7 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
             JSONObject raw = new JSONObject(line);
             check(!raw.getBoolean("root") && raw.getInt("collectorUid") == android.os.Process.myUid(),
                     "collector did not run in the ordinary application UID");
+            assertSelfExcluded(raw, siblingPid);
             check(raw.getJSONObject("capabilities").getString("collectorSelinux").contains(":untrusted_app:"),
                     "collector did not use actual untrusted_app domain");
             JSONObject scan = raw.getJSONObject("cgroupScan");
@@ -375,6 +467,7 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
             maxCollectionMs = Math.max(maxCollectionMs, raw.optLong("collectionMs"));
             maxCgroupMs = Math.max(maxCgroupMs, scan.optLong("durationMs"));
             JSONObject report = engine.process(raw);
+            assertSelfExcluded(report, siblingPid);
             maxAnomalies = Math.max(maxAnomalies, report.getInt("cgroupAnomalyCount"));
             JSONArray monitored = report.getJSONArray("processes");
             double lastCpu = Double.POSITIVE_INFINITY;
@@ -396,12 +489,35 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         Files.write(new File(files, "cgroup-real-processed.jsonl").toPath(),
                 processed.toString().getBytes(StandardCharsets.UTF_8));
         result.putInt("realSamples", lines.size());
+        result.putInt("excludedSameUidTestPid", siblingPid);
+        result.putBoolean("selfCpuExclusionVerified", true);
         result.putInt("incompleteCgroupSamples", incomplete);
         result.putInt("availablePathSamples", available);
         result.putInt("missingPathObservations", missingObservations);
         result.putInt("maxPathAnomalies", maxAnomalies);
         result.putLong("maxCollectionMs", maxCollectionMs);
         result.putLong("maxCgroupMs", maxCgroupMs);
+    }
+
+    static void assertSelfExcluded(JSONObject report, int siblingPid) throws Exception {
+        java.util.Set<Integer> ownIds = new java.util.HashSet<>();
+        ownIds.add(android.os.Process.myPid());
+        ownIds.add(report.getInt("collectorPid"));
+        if (siblingPid > 0) ownIds.add(siblingPid);
+        String[] tasks = new File("/proc/self/task").list();
+        check(tasks != null && tasks.length > 0, "cannot enumerate App threads for verification");
+        for (String tid : tasks) ownIds.add(Integer.parseInt(tid));
+        for (String key : new String[]{"processes", "cpuSamples", "processEvents"}) {
+            JSONArray rows = report.optJSONArray(key);
+            for (int i = 0; rows != null && i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                check(!ownIds.contains(row.getInt("pid")) && row.optInt("uid", -1) != android.os.Process.myUid(),
+                        "own process/thread leaked into " + key + ": " + row.getInt("pid"));
+            }
+        }
+        check(report.getInt("cpuExclusionUid") == android.os.Process.myUid()
+                        && report.getInt("cpuExcludedPidTidCount") >= 2,
+                "collector did not report its self exclusion scope");
     }
 
     private static void validateMissing(JSONObject process, JSONObject evidence) throws Exception {

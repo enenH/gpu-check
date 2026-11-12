@@ -1,8 +1,10 @@
 package com.gpucheck.app;
 
-/** Admission to observation only; cgroup anomalies never establish root identity. */
+/** CPU monitoring excludes our App UID; GPU lifecycle checks retain their evidence scope. */
 public final class MonitoredProcessFilter {
     private MonitoredProcessFilter() { }
+
+    public static boolean acceptsCpu(int pid, boolean self) { return pid > 0 && !self; }
 
     public static boolean accepts(boolean self, boolean rootCandidate, boolean cgroupAnomaly) {
         return !self && (rootCandidate || cgroupAnomaly);

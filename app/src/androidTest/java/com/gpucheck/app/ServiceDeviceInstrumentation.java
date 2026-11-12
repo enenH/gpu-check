@@ -240,6 +240,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         validation("SAMPLING".equals(report.optString("samplingState")), "missing_sampling_state",
                 "Real report does not state SAMPLING");
         JSONArray rows = report.getJSONArray("processes");
+        CgroupWatchInstrumentation.assertSelfExcluded(report, -1);
         List<Integer> expectedOrder = validateReportOrder(rows);
         JSONObject frame = new JSONObject().put("phase", phase).put("collectorPid", report.getInt("collectorPid"))
                 .put("sampleIndex", report.getLong("sampleIndex")).put("elapsedMs", report.optLong("elapsedMs"))
@@ -299,10 +300,9 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                 JSONArray shownRows = shown.getJSONArray("processes");
                 validateReportOrder(shownRows);
                 List<Integer> expected = new ArrayList<>();
-                for (int i = 0; i < shownRows.length(); i++) {
+                for (int i = 0; i < Math.min(10, shownRows.length()); i++) {
                     JSONObject row = shownRows.getJSONObject(i);
-                    double cpu = row.optDouble("cpuPercent", -1);
-                    if (!Double.isFinite(cpu) || cpu < 0 || cpu >= 0.2) expected.add(row.getInt("pid"));
+                    expected.add(row.getInt("pid"));
                 }
                 validation(order.length() == expected.size(), "ui_candidate_count", "UI omitted or added a candidate");
                 for (int i = 0; i < Math.min(order.length(), expected.size()); i++) {
@@ -320,7 +320,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                     .put("button", ((Button) field("startButton")).getText().toString())
                     .put("visibleErrors", errors.getVisibility() == View.VISIBLE ? errors.getText().toString() : "")
                     .put("listText", allText(list)).put("pidOrder", order)
-                    .put("zeroCpuHidden", true).put("minimumVisibleCpuPercent", 0.2));
+                    .put("displayLimit", 10).put("minimumVisibleCpuPercent", 0));
         });
         return result.get();
     }

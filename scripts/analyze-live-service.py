@@ -97,6 +97,7 @@ def analyze(folder: Path, require_idle: bool) -> dict:
         expected = [p["pid"] for p in report["processes"]
                     if (not ui.get("zeroCpuHidden") or p.get("cpuPercent") != 0)
                     and (cpu_key(p)[0] > 0 or -cpu_key(p)[0] >= ui.get("minimumVisibleCpuPercent", 0))]
+        expected = expected[:ui.get("displayLimit", len(expected))]
         assert ui["pidOrder"] == expected, (ui, expected)
         if ui.get("zeroCpuHidden"):
             target = next((p for p in report["processes"] if p["pid"] == high), None)

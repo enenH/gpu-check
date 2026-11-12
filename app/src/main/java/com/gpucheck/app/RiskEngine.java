@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.Set;
 
 final class RiskEngine {
-    private static final int CANDIDATE_LIMIT = 1024;
+    private static final int LIFECYCLE_LIMIT = 1024;
     private final RiskPolicy policy;
     private final AvcRiskPolicy avcPolicy;
     private final CgroupWatchPolicy cgroupPolicy;
@@ -59,7 +59,7 @@ final class RiskEngine {
                 && Boolean.TRUE.equals(cgroupScan.opt("calibrationValid"))
                 && cgroupScan.optLong("sampleIndex", -1) == sampleIndex;
         cgroupPolicy.beginSnapshot(sampleIndex, elapsed, cgroupPathMethodAvailable);
-        JSONArray input = mergeCurrentRootCpuRows(report);
+        JSONArray input = mergeCurrentCpuRows(report);
         JSONArray nativeEvents = report.optJSONArray("processEvents");
         List<JSONObject> sorted = new ArrayList<>();
         int high = 0;
@@ -77,16 +77,16 @@ final class RiskEngine {
         for (int i = 0; input != null && i < input.length(); i++) {
             JSONObject p = input.getJSONObject(i);
             int pid = p.optInt("pid", -1);
+            boolean isSelf = isSelf(p, report);
+            if (!MonitoredProcessFilter.acceptsCpu(pid, isSelf) || occurrences.get(pid) != 1) continue;
             int observedUid = p.optInt("uid", -1);
             String processIdentity = p.optString("identityToken", "");
-            boolean isSelf = isSelf(p, report);
             CgroupWatchPolicy.Decision cgroup = cgroupPolicy.evaluate(pid, processIdentity,
                     occurrences.get(pid) == 1 && Boolean.TRUE.equals(p.opt("identityVerified"))
                             ? cgroupCheck(p.optJSONObject("cgroupCheck")) : null, isSelf);
             boolean rootCandidate = !isSelf && isRoot(p);
-            boolean monitored = MonitoredProcessFilter.accepts(isSelf, rootCandidate, cgroup.anomaly);
             p.put("cgroupAnomaly", cgroup.anomaly).put("cgroupWatch", cgroupWatchJson(cgroup))
-                    .put("rootCandidate", rootCandidate).put("monitoredCandidate", monitored);
+                    .put("rootCandidate", rootCandidate).put("monitoredCandidate", true);
             currentRows.put(processKey(p), p);
             if (rootCandidate) currentRoots.put(pid, processIdentity);
             if (cgroup.validMissing) {
@@ -111,10 +111,10 @@ final class RiskEngine {
             if ((observedUid > 0 || explicitOtherDomain) && !cgroup.validMissing && !watchedExit) {
                 lifecycle.revoke(pid, processIdentity);
             }
-            if (!monitored) continue;
             p.remove("riskBasis");
             p.remove("riskConfidence");
-            String risk = "WATCH", reason = cgroup.reason;
+            String risk = "MONITORING", reason = sortableCpu(p) < 0
+                    ? "正在建立 CPU 基线或当前 CPU 时钟不可读取。" : "正在持续采样该进程的 CPU 使用率。";
             int consecutive = 0;
             if (rootCandidate) {
                 rootCount++;
@@ -156,8 +156,6 @@ final class RiskEngine {
         sorted.sort(Comparator.comparingDouble(RiskEngine::sortableCpu).reversed()
                 .thenComparingInt(p -> p.optInt("pid", Integer.MAX_VALUE)));
         int eligibleCandidates = sorted.size();
-        int capacityOmissions = Math.max(0, eligibleCandidates - CANDIDATE_LIMIT);
-        if (capacityOmissions > 0) sorted.subList(CANDIDATE_LIMIT, sorted.size()).clear();
         Set<String> retainedIdentities = new HashSet<>();
         high = watching = rootDenied = rootCount = cgroupAnomalies = 0;
         for (JSONObject p : sorted) {
@@ -188,17 +186,22 @@ final class RiskEngine {
             if (!retainedIdentities.contains(processKey(p))) continue;
             JSONObject current = currentRows.get(processKey(p));
             if (current != null && current.optInt("uid", -1) >= 0) p.put("uid", current.optInt("uid"));
+            if (isSelf(p, report)) continue;
             boolean anomaly = current != null && current.optBoolean("cgroupAnomaly");
-            boolean rootCandidate = isRoot(p);
-            if (!MonitoredProcessFilter.accepts(isSelf(p, report), rootCandidate, anomaly)) continue;
+            boolean rootCandidate = current != null && current.optBoolean("rootCandidate");
+            if (sortableCpu(p) < 0) continue;
             p.put("cgroupAnomaly", anomaly).put("rootCandidate", rootCandidate).put("monitoredCandidate", true);
             if (current != null) p.put("cgroupWatch", current.optJSONObject("cgroupWatch"));
             if (sampledIdentities.add(processKey(p))) monitoredCpuSamples.put(p);
         }
         for (JSONObject p : sorted) {
-            if (p.optBoolean("cgroupAnomaly") && sampledIdentities.add(processKey(p))) {
-                // The anomaly observation remains eligible when its CPU clock is idle or unavailable.
-                monitoredCpuSamples.put(p);
+            if (sortableCpu(p) >= 0 && sampledIdentities.add(processKey(p))) {
+                monitoredCpuSamples.put(new JSONObject().put("pid", p.optInt("pid"))
+                        .put("uid", p.optInt("uid", -1)).put("identityToken", p.optString("identityToken"))
+                        .put("identityVerified", p.optBoolean("identityVerified"))
+                        .put("cpuPercent", p.optDouble("cpuPercent", -1))
+                        .put("rootCandidate", p.optBoolean("rootCandidate"))
+                        .put("cgroupAnomaly", p.optBoolean("cgroupAnomaly")).put("monitoredCandidate", true));
             }
         }
         double[] slotDeltas = null;
@@ -217,12 +220,15 @@ final class RiskEngine {
                 }
             }
         }
-        // RootSample is the existing lifecycle input type; membership in this list now means
-        // admitted observation, and does not assert a root UID for cgroup-only candidates.
+        // CPU monitoring covers external processes. GPU lifecycle correlation keeps its original scope
+        // and separate bounded state, so ordinary CPU rows cannot create GPU/root evidence.
         List<CpuGpuLifecycle.RootSample> monitoredLifecycleSamples = new ArrayList<>();
-        for (int i = 0; i < monitoredCpuSamples.length(); i++) {
-            JSONObject p = monitoredCpuSamples.getJSONObject(i);
-            if (p.optBoolean("identityVerified")) monitoredLifecycleSamples.add(new CpuGpuLifecycle.RootSample(
+        int lifecycleEligibleCount = 0;
+        for (JSONObject p : sorted) {
+            if (!p.optBoolean("identityVerified") || !MonitoredProcessFilter.accepts(isSelf(p, report),
+                    p.optBoolean("rootCandidate"), p.optBoolean("cgroupAnomaly"))) continue;
+            lifecycleEligibleCount++;
+            if (monitoredLifecycleSamples.size() < LIFECYCLE_LIMIT) monitoredLifecycleSamples.add(new CpuGpuLifecycle.RootSample(
                     p.optInt("pid"), p.optString("identityToken", ""), p.optDouble("cpuPercent", -1)));
         }
         List<CpuGpuLifecycle.ProcessEvent> processEvents = new ArrayList<>();
@@ -234,7 +240,7 @@ final class RiskEngine {
         }
         boolean lifecycleCoverageLimited = report.optBoolean("processEventsTruncated")
                 || report.optBoolean("candidatesTruncated")
-                || (nativeEvents != null && nativeEvents.length() > 512) || capacityOmissions > 0;
+                || (nativeEvents != null && nativeEvents.length() > 512) || lifecycleEligibleCount > LIFECYCLE_LIMIT;
         // Retain known matches, but still consume trustworthy exits to retire their identities.
         if (lifecycleCoverageLimited) lifecycle.resetObservations();
         CpuGpuLifecycle.GpuSample gpuSample = new CpuGpuLifecycle.GpuSample(
@@ -279,19 +285,22 @@ final class RiskEngine {
                 .put("rootProcessCount", rootCount).put("rootWatchCount", watching)
                 .put("monitoredProcessCount", sorted.size()).put("cgroupAnomalyCount", cgroupAnomalies)
                 .put("cgroupWatchCount", cgroupWatching)
-                .put("deniedProcesses", rootDenied).put("probeScope", "root_identity_or_cgroup_named_path_mismatch")
+                .put("rootDeniedProcesses", rootDenied).put("probeScope", "all_discovered_external_processes")
                 .put("cpuSamples", monitoredCpuSamples).put("cpuSampleCount", monitoredCpuSamples.length())
                 .put("returnedCandidates", sorted.size())
-                .put("candidateLimit", CANDIDATE_LIMIT)
-                .put("candidatesTruncated", report.optBoolean("candidatesTruncated") || capacityOmissions > 0)
+                .put("candidateLimit", 0)
+                .put("candidatesTruncated", report.optBoolean("candidatesTruncated"))
                 .put("matchedCandidates", eligibleCandidates)
-                .put("monitoredCandidatesTruncated", capacityOmissions > 0)
-                .put("monitoredEligibleCount", eligibleCandidates).put("monitoredCapacityOmissions", capacityOmissions)
+                .put("monitoredCandidatesTruncated", false)
+                .put("monitoredEligibleCount", eligibleCandidates).put("monitoredCapacityOmissions", 0)
+                .put("lifecycleEligibleCount", lifecycleEligibleCount).put("lifecycleLimit", LIFECYCLE_LIMIT)
+                .put("lifecycleCapacityOmissions", Math.max(0, lifecycleEligibleCount - LIFECYCLE_LIMIT))
                 .put("threshold", threshold).put("windows", windows).put("intervalMs", intervalMs)
                 .put("sessionStartedAt", sessionStartedAt).put("status", status)
                 .put("rule", "普通权限组合规则：目标 PID 的 AVC 拒绝日志指向 root 执行域、CPU ≥ " + threshold
                         + "% 连续 " + windows + " 次、全局 memstore 连续 " + windows + " 次推进，报告高风险（启发式）。"
-                        + "有效 UID 0 或匹配 root 目标域的进程沿用原规则；同一存活 PID 连续 3 次未匹配已校准 UID 范围内的参考命名路径时也纳入监听，与 CPU 高低无关。"
+                        + "监听所有可发现的外部进程 CPU，包括普通和零负载进程；排除本应用、采集器、同 UID 进程及其线程，页面仅显示 CPU 排序前 10 个。"
+                        + "有效 UID 0、匹配 root 目标域和连续 3 次 cgroup 命名路径未匹配的证据单独用于风险与 GPU 生命周期观察。"
                         + "命名路径差异不表示进程没有内核 cgroup，不证明 root 身份或 GPU 归属。")
                 .put("gpuEvidenceNote", "全局 GPU 活动单独报告，不分配给高 CPU 进程；普通应用不能读取的身份或设备归属保持未知。")
                 .put("cpuUnit", "one_core_percent");
@@ -314,7 +323,7 @@ final class RiskEngine {
     }
 
     /** Merge only evidence delivered in this snapshot; never resurrect cached metadata or CPU. */
-    private JSONArray mergeCurrentRootCpuRows(JSONObject report) throws JSONException {
+    private JSONArray mergeCurrentCpuRows(JSONObject report) throws JSONException {
         JSONArray input = report.optJSONArray("processes"), cpu = report.optJSONArray("cpuSamples");
         report.put("nativeMatchedCandidates", report.optInt("matchedCandidates", input == null ? 0 : input.length()))
                 .put("nativeReturnedCandidates", input == null ? 0 : input.length())
@@ -334,7 +343,7 @@ final class RiskEngine {
                 cpuOccurrences.put(pid, cpuOccurrences.getOrDefault(pid, 0) + 1);
             }
         }
-        int added = 0;
+        int added = 0, addedRoots = 0;
         for (int i = 0; cpu != null && i < cpu.length(); i++) {
             JSONObject row = cpu.optJSONObject(i);
             if (row == null) continue;
@@ -343,12 +352,11 @@ final class RiskEngine {
             double measuredCpu = row.optDouble("cpuPercent", -1);
             if (pid <= 0 || presentPids.contains(pid) || cpuOccurrences.get(pid) != 1
                     || !Boolean.TRUE.equals(row.opt("identityVerified")) || identity.trim().isEmpty()
-                    || !Double.isFinite(measuredCpu) || measuredCpu < 0 || isSelf(row, report) || !isRoot(row)) continue;
+                    || !Double.isFinite(measuredCpu) || measuredCpu < 0 || isSelf(row, report)) continue;
             long age = row.optLong("avcEvidenceAgeMs", -1);
             boolean freshAvc = age >= 0 && age <= AvcEvidence.MAX_AGE_MS
-                    && RootProcessFilter.accepts(-1, true, identity, row.optBoolean("avcRootDomainHint"),
-                        row.optString("avcTargetContext"), row.optString("avcIdentityToken"));
-            if (uid < 0 && !freshAvc) continue;
+                    && identity.equals(row.optString("avcIdentityToken"))
+                    && !row.optString("avcTargetContext").isEmpty();
             if (trustedExit(report.optJSONArray("processEvents"), pid, identity, report.optJSONObject("globalGpu"))) continue;
             JSONObject observation = new JSONObject().put("pid", pid).put("uid", uid)
                     .put("name", "PID " + pid).put("identityToken", identity).put("identityVerified", true)
@@ -373,8 +381,9 @@ final class RiskEngine {
                 }
             }
             merged.put(observation); presentPids.add(pid); added++;
+            if (!isSelf(observation, report) && isRoot(observation)) addedRoots++;
         }
-        report.put("cpuOnlyRootCandidates", added);
+        report.put("cpuOnlyProcesses", added).put("cpuOnlyRootCandidates", addedRoots);
         return merged;
     }
 

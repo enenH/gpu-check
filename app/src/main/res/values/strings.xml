@@ -17,11 +17,10 @@
     <string name="sampling_status">更新 %1$s  ·  已探测 PID %2$d  ·  读取受限 %3$d</string>
     <string name="no_retained_results">不保留上次检测结果</string>
     <string name="parse_failed">采集结果无法解析：%1$s</string>
-    <string name="candidates_title">监听进程</string>
-    <string name="no_monitored_candidates">尚未发现需要监听的进程</string>
-    <string name="no_active_cpu_processes">当前没有达到显示阈值的进程</string>
-    <string name="low_cpu_hidden_description" formatted="false">CPU 负载低于 0.2% 的进程已隐藏，达到阈值后自动显示。</string>
-    <string name="monitored_candidates_description">发现 root 候选或连续确认 cgroup 路径未匹配后，自动加入监听。</string>
+    <string name="candidates_title">CPU 使用率前 10</string>
+    <string name="cpu_leaders_title">CPU 排行 · 前 %1$d / 共 %2$d</string>
+    <string name="no_monitored_candidates">尚未发现可采样的进程</string>
+    <string name="monitored_candidates_description">排除本应用的进程与线程，持续采样其余可发现进程，按 CPU 从高到低显示前 10 个；未知 CPU 排在末尾。</string>
     <string name="cgroup_check_unavailable">cgroup 路径探测校准不可用</string>
     <string name="cgroup_check_available">cgroup 路径探测可用</string>
     <string name="cgroup_anomaly_title">发现 cgroup 路径异常</string>
@@ -32,7 +31,6 @@
     <string name="environment_anomaly_description">发现 pidfd 存活状态与进程目录可见性冲突；下方可查看依据，root 高风险数独立统计。</string>
     <string name="environment_conflict_summary">pidfd 仍存活，但 /proc/PID 复查返回不存在。冲突 PID：%1$s\n环境一致性异常不表示这些 PID 已确认属于 root。</string>
     <string name="environment_conflict_details">点击查看 pidfd / stat 原始依据</string>
-    <string name="counted_title">%1$s · %2$d</string>
     <string name="lifecycle_association_line">进程启停关联 · %1$s</string>
     <string name="gpu_overlay_confirmed">确认使用gpu悬浮窗</string>
     <string name="lifecycle_onset_ambiguous">多个进程或槽同步，时序关联有歧义</string>

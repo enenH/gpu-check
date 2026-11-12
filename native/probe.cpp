@@ -142,17 +142,31 @@ bool processClock(int pid, uint64_t& cpu) {
     if (clock_gettime(clock, &t) || t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000L) return false;
     cpu = uint64_t(t.tv_sec) * 1000000000ULL + uint64_t(t.tv_nsec); return true;
 }
-std::set<int> ownProcesses(int appPid) {
+std::set<int> ownProcesses(int appPid, std::set<int>& visiblePids) {
     std::set<int> result{int(getpid()), appPid};
     DIR* directory = opendir("/proc");
-    if (!directory) return result;
-    while (dirent* entry = readdir(directory)) {
-        uint64_t pid = 0;
-        if (!number(entry->d_name, pid) || pid == 0 || pid > INT_MAX) continue;
-        const Text status = readText("/proc/" + std::to_string(pid) + "/status");
-        if (status.ok && parseUid(status.value) == int(geteuid())) result.insert(int(pid));
+    if (directory) {
+        while (dirent* entry = readdir(directory)) {
+            uint64_t pid = 0;
+            if (!number(entry->d_name, pid) || pid == 0 || pid > INT_MAX) continue;
+            visiblePids.insert(int(pid));
+            const Text status = readText("/proc/" + std::to_string(pid) + "/status");
+            if (status.ok && parseUid(status.value) == int(geteuid())) result.insert(int(pid));
+        }
+        closedir(directory);
     }
-    closedir(directory);
+    // /proc enumeration lists process leaders. Explicitly cover every task of our
+    // App, collector and other same-UID processes, including their worker threads.
+    const std::set<int> processIds = result;
+    for (int pid : processIds) {
+        DIR* tasks = opendir(("/proc/" + std::to_string(pid) + "/task").c_str());
+        if (!tasks) continue;
+        while (dirent* entry = readdir(tasks)) {
+            uint64_t tid = 0;
+            if (number(entry->d_name, tid) && tid > 0 && tid <= INT_MAX) result.insert(int(tid));
+        }
+        closedir(tasks);
+    }
     return result;
 }
 int openPidfd(int pid) {
@@ -208,6 +222,10 @@ public:
     static constexpr size_t capacity = 512;
     bool truncated = false;
     void clear() { events.clear(); truncated = false; }
+    void exclude(const std::set<int>& ids) {
+        events.erase(std::remove_if(events.begin(), events.end(),
+            [&](const Event& event) { return ids.count(event.pid) != 0; }), events.end());
+    }
     size_t size() const { return events.size(); }
     void add(const char* type, int pid, const std::string& identity, const char* evidence, short revents = 0) {
         if (events.size() >= capacity) { truncated = true; return; }
@@ -241,8 +259,8 @@ struct Process {
     cgroup_watch::Check cgroupCheck;
 };
 
-// A separate, bounded signal feed keeps observed zero-CPU intervals even when the
-// UI omits idle rows. It never backfills a missing clock sample with zero.
+// Every current, valid CPU window is retained, including newly idle processes.
+// Missing clocks and baseline windows are never backfilled with zero.
 struct CpuSample {
     int pid = 0;
     bool identityVerified = false;
@@ -258,66 +276,16 @@ bool validCpuSample(const CpuSample& p) {
         && p.beginNs > 0 && p.endNs > p.beginNs;
 }
 class CpuSignalCache {
-    struct Track {
-        std::string identityToken;
-        uint64_t lastActiveNs = 0, lastSampleNs = 0;
-        double recentPeak = 0;
-    };
-    std::map<int, Track> tracks;
 public:
-    static constexpr size_t capacity = 128;
-    static constexpr uint64_t retentionNs = 120000000000ULL;
     std::vector<CpuSample> samples;
-    bool truncated = false;
-    size_t eligibleCount = 0, capacityOmissions = 0, capacityEvictions = 0;
-    void update(const std::map<int, CpuSample>& current, const std::set<int>& priority = {}) {
-        samples.clear(); truncated = false; eligibleCount = capacityOmissions = capacityEvictions = 0;
-        for (auto it = tracks.begin(); it != tracks.end();) {
-            const auto found = current.find(it->first);
-            if (found == current.end() || !validCpuSample(found->second)
-                || found->second.identityToken != it->second.identityToken) {
-                it = tracks.erase(it);
-                continue;
-            }
-            const CpuSample& p = found->second;
-            Track& track = it->second;
-            if (p.endNs <= track.lastSampleNs || p.beginNs != track.lastSampleNs) { it = tracks.erase(it); continue; }
-            // Priority is not a measured signal: discount old bursts to admit newly busy PIDs.
-            const double decay = std::exp(-double(p.endNs - track.lastSampleNs) / double(retentionNs));
-            track.recentPeak = std::max(p.cpu, track.recentPeak * decay);
-            track.lastSampleNs = p.endNs;
-            if (p.cpu > 0) track.lastActiveNs = p.endNs;
-            if (p.endNs - track.lastActiveNs > retentionNs && !priority.count(it->first)) { it = tracks.erase(it); continue; }
-            ++it;
-        }
-        std::set<int> previouslyTracked;
-        for (const auto& entry : tracks) previouslyTracked.insert(entry.first);
+    void update(const std::map<int, CpuSample>& current) {
+        samples.clear();
         for (const auto& entry : current) {
-            const CpuSample& p = entry.second;
-            if (!validCpuSample(p) || (p.cpu <= 0 && !priority.count(entry.first)) || tracks.count(entry.first)) continue;
-            tracks.emplace(entry.first, Track{p.identityToken, p.endNs, p.endNs, p.cpu});
+            if (validCpuSample(entry.second)) samples.push_back(entry.second);
         }
-        eligibleCount = tracks.size();
-        std::vector<int> ranking;
-        for (const auto& entry : tracks) ranking.push_back(entry.first);
-        std::sort(ranking.begin(), ranking.end(), [&](int a, int b) {
-            const double scoreA = std::max(current.at(a).cpu, tracks.at(a).recentPeak * 0.25);
-            const double scoreB = std::max(current.at(b).cpu, tracks.at(b).recentPeak * 0.25);
-            if (scoreA != scoreB) return scoreA > scoreB;
-            if (current.at(a).cpu != current.at(b).cpu) return current.at(a).cpu > current.at(b).cpu;
-            if (tracks.at(a).lastActiveNs != tracks.at(b).lastActiveNs) return tracks.at(a).lastActiveNs > tracks.at(b).lastActiveNs;
-            return a < b;
+        std::sort(samples.begin(), samples.end(), [](const CpuSample& a, const CpuSample& b) {
+            return a.cpu != b.cpu ? a.cpu > b.cpu : a.pid < b.pid;
         });
-        if (ranking.size() > capacity) {
-            truncated = true;
-            capacityOmissions = ranking.size() - capacity;
-            for (size_t i = capacity; i < ranking.size(); ++i) {
-                if (previouslyTracked.count(ranking[i])) ++capacityEvictions;
-                tracks.erase(ranking[i]);
-            }
-            ranking.resize(capacity);
-        }
-        for (int pid : ranking) samples.push_back(current.at(pid));
     }
     void json(std::ostream& out) const {
         out << '[';
@@ -515,7 +483,8 @@ void processJson(std::ostream& out, const Process& p) {
         << ",\"exe\":" << q(p.exe) << ",\"cmdline\":" << q(p.cmdline) << ",\"startTimeTicks\":" << (p.procReadable ? std::to_string(p.start) : "null")
         << ",\"startTimeKnown\":" << p.procReadable
         << ",\"identityVerified\":" << p.identityVerified << ",\"identitySource\":" << q(p.identitySource) << ",\"identityToken\":" << q(p.identityToken)
-        << ",\"uidSource\":" << q(p.uidSource) << ",\"cpuPercent\":" << p.cpu << ",\"cpuSource\":\"dynamic_process_sched_clock\""
+        << ",\"uidSource\":" << q(p.uidSource) << ",\"cpuPercent\":" << std::defaultfloat << std::setprecision(12)
+        << p.cpu << std::fixed << std::setprecision(3) << ",\"cpuSource\":\"dynamic_process_sched_clock\""
         << ",\"metadataAccessible\":" << (p.procReadable || p.uid >= 0)
         << ",\"probeTargetPid\":" << p.pid << ",\"probeSourcePid\":" << getpid() << ",\"probeEpochMs\":" << p.probeEpochMs
         << ",\"probeEndEpochMs\":" << p.probeEndEpochMs << ",\"probeMonotonicNs\":" << p.probeMonotonicNs << ",\"probeEndMonotonicNs\":" << p.probeEndMonotonicNs
@@ -679,8 +648,15 @@ public:
     }
 };
 bool selfTest() {
+    ProcessEventBatch selfEvents;
+    selfEvents.add("APPEARED", 42, "self", "new_pidfd_after_baseline");
+    selfEvents.add("EXITED", 43, "self-worker", "pidfd_readable");
+    selfEvents.add("APPEARED", 44, "external", "new_pidfd_after_baseline");
+    selfEvents.exclude({42, 43});
+    std::ostringstream selfEventJson; selfEvents.json(selfEventJson);
     StatFields stat;
-    bool ok = cgroup_watch::selfTest() && parseStat("123 (odd ) name) S 1 2 3 0 5 6 7 8 9 10 123 77 13 14 15 16 4 18 9999 1000 42", stat)
+    bool ok = selfEvents.size() == 1 && selfEventJson.str().find("\"pid\":44") != std::string::npos
+        && cgroup_watch::selfTest() && parseStat("123 (odd ) name) S 1 2 3 0 5 6 7 8 9 10 123 77 13 14 15 16 4 18 9999 1000 42", stat)
         && stat.start == 9999 && stat.ticks == 200 && stat.name == "odd ) name"
         && parseUid("Uid:\t1000\t0\t0\t0\n") == 0 && parseUid("Uid: bad") == -1
         && int32_t((~uint32_t(2) << 3) | 2U) == -22;
@@ -707,30 +683,33 @@ bool selfTest() {
     signalTest.update({{7, cpu(7, "first", 0, 6, 124)}});
     ok = ok && signalTest.samples.size() == 1; // exactly 120 seconds since observed activity
     signalTest.update({{7, cpu(7, "first", 0, 124, 126)}});
-    ok = ok && signalTest.samples.empty();
+    ok = ok && signalTest.samples.size() == 1 && signalTest.samples.front().cpu == 0;
     signalTest.update({{7, cpu(7, "first", 10, 126, 128)}});
     signalTest.update({{7, cpu(7, "replacement", 0, 128, 130)}});
-    ok = ok && signalTest.samples.empty(); // a reused PID is never given the old zero history
+    ok = ok && signalTest.samples.size() == 1 && signalTest.samples.front().identityToken == "replacement";
     signalTest.update({{7, cpu(7, "replacement", 10, 130, 132)}});
     signalTest.update({});
     ok = ok && signalTest.samples.empty(); // missing is not an idle sample
     signalTest.update({{7, cpu(7, "replacement", 0, 134, 136)}});
-    ok = ok && signalTest.samples.empty();
-    signalTest.update({{7, cpu(7, "cgroup-idle", 0, 136, 138)}}, {7});
+    ok = ok && signalTest.samples.size() == 1 && signalTest.samples.front().cpu == 0;
+    signalTest.update({{7, cpu(7, "cgroup-idle", 0, 136, 138)}});
     ok = ok && signalTest.samples.size() == 1 && signalTest.samples[0].cpu == 0;
-    signalTest.update({{7, cpu(7, "cgroup-idle", 0, 138, 400)}}, {7});
+    signalTest.update({{7, cpu(7, "cgroup-idle", 0, 138, 400)}});
     ok = ok && signalTest.samples.size() == 1 && signalTest.samples[0].cpu == 0;
-    signalTest.update({{7, cpu(7, "cgroup-idle", -1, 400, 402)}}, {7});
+    signalTest.update({{7, cpu(7, "cgroup-idle", -1, 400, 402)}});
     ok = ok && signalTest.samples.empty();
     std::map<int, CpuSample> crowded;
-    for (int pid = 1; pid <= 129; ++pid) crowded.emplace(pid, cpu(pid, "bounded", double(pid), 2, 4));
+    for (int pid = 1; pid <= 1200; ++pid) crowded.emplace(pid, cpu(pid, "current", double(pid), 2, 4));
     signalTest.update(crowded);
-    ok = ok && signalTest.samples.size() == 128 && signalTest.truncated && signalTest.capacityOmissions == 1
-        && std::none_of(signalTest.samples.begin(), signalTest.samples.end(), [](const CpuSample& p) { return p.pid == 1; });
+    ok = ok && signalTest.samples.size() == 1200 && signalTest.samples.front().pid == 1200
+        && signalTest.samples.back().pid == 1;
     crowded[1] = cpu(1, "idle-priority", 0, 4, 6);
-    signalTest.update(crowded, {1});
-    ok = ok && signalTest.samples.size() == 128 && signalTest.samples.front().pid == 129
-        && std::none_of(signalTest.samples.begin(), signalTest.samples.end(), [](const CpuSample& p) { return p.pid == 1; });
+    signalTest.update(crowded);
+    ok = ok && signalTest.samples.size() == 1200 && signalTest.samples.front().pid == 1200
+        && signalTest.samples.back().pid == 1 && signalTest.samples.back().cpu == 0;
+    crowded[1] = cpu(1, "new-baseline", -1, 6, 8);
+    signalTest.update(crowded);
+    ok = ok && signalTest.samples.size() == 1199;
     const auto conflict = [](const std::string& identity, int error, bool opened, bool before, bool after) {
         return EnvironmentObservation{77, identity, opened, before, after, true, error, 1000, 1001, 1000000, 2000000};
     };
@@ -778,7 +757,8 @@ bool selfTest() {
 }
 } // namespace
 int main(int argc, char** argv) {
-    unsigned interval = 2000, samples = 0, limit = 65536; bool diagnostics = false, test = false;
+    unsigned interval = 2000, samples = 0, limit = 65536;
+    bool diagnostics = false, test = false, explicitPidLimit = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--once") samples = 1;
@@ -788,15 +768,16 @@ int main(int argc, char** argv) {
         else if ((arg == "--interval-ms" || arg == "--samples" || arg == "--pid-limit") && i + 1 < argc) {
             uint64_t n = 0; if (!number(argv[++i], n) || n > 10000000) return 2;
             if (arg == "--interval-ms") { if (n < 500 || n > 10000) return 2; interval = unsigned(n); }
-            else if (arg == "--pid-limit") { if (n < 1024 || n > 262144) return 2; limit = unsigned(n); }
+            else if (arg == "--pid-limit") { if (n < 1024 || n > 4194304) return 2; limit = unsigned(n); explicitPidLimit = true; }
             else samples = unsigned(n);
-        } else { fprintf(stderr, "Usage: libgpu_probe.so [--interval-ms 500..10000] [--samples N|--once|--capabilities] [--pid-limit 1024..262144] [--watch-stdin] [--self-test]\n"); return 2; }
+        } else { fprintf(stderr, "Usage: libgpu_probe.so [--interval-ms 500..10000] [--samples N|--once|--capabilities] [--pid-limit 1024..4194304] [--watch-stdin] [--self-test]\n"); return 2; }
     }
     if (test) return selfTest() ? 0 : 1;
     struct sigaction action{}; sigemptyset(&action.sa_mask); action.sa_handler = onStop;
     sigaction(SIGTERM, &action, nullptr); sigaction(SIGINT, &action, nullptr);
     action.sa_handler = onSigsys; sigaction(SIGSYS, &action, nullptr); signal(SIGPIPE, SIG_IGN);
-    Capabilities caps = capabilities(); if (caps.pidMaxReadable) limit = std::min(limit, caps.pidMax);
+    Capabilities caps = capabilities();
+    if (caps.pidMaxReadable) limit = explicitPidLimit ? std::min(limit, caps.pidMax) : caps.pidMax;
     GlobalGpu globalGpu;
     uint64_t session = nowNs(), epoch = session, nextAt = session;
     std::map<int, Previous> previous;
@@ -806,25 +787,31 @@ int main(int argc, char** argv) {
     std::set<int> observedPids;
     std::set<int> previousCgroupCandidates;
     cgroup_watch::Scanner cgroupScanner;
-    constexpr size_t candidateLimit = 1024;
+    unsigned scanCursor = 1;
     bool previousRangeComplete = false;
     const int appPid = int(getppid());
     for (unsigned sample = 0; alive() && (!samples || sample < samples); ++sample) {
         processEvents.clear();
         uint64_t begin = nowNs(); std::map<int, std::pair<uint64_t, uint64_t>> clocks;
-        const std::set<int> excluded = ownProcesses(appPid);
+        std::set<int> visiblePids;
+        std::set<int> excluded = ownProcesses(appPid, visiblePids);
         unsigned scanned = 0; bool complete = true;
         if (diagnostics) {
             for (int pid : {1, int(getpid()), int(getppid())}) { uint64_t value = 0; ++scanned; if (!excluded.count(pid) && processClock(pid, value)) clocks[pid] = {value, nowNs()}; }
         } else {
-            for (unsigned pid = 1; pid <= limit; ++pid) {
-                if ((pid & 1023) == 0 && (!alive() || nowNs() - begin > 1000000000ULL)) { complete = false; break; }
+            // A timed-out sweep resumes on the next round; known PIDs are sampled every round below.
+            for (unsigned offset = 0; offset < limit; ++offset) {
+                if ((offset & 1023) == 0 && (!alive() || nowNs() - begin > 1000000000ULL)) { complete = false; break; }
+                const unsigned pid = scanCursor;
+                scanCursor = pid >= limit ? 1 : pid + 1;
                 ++scanned; uint64_t value = 0;
                 if (excluded.count(int(pid))) continue;
                 if (processClock(int(pid), value)) clocks[int(pid)] = {value, nowNs()};
             }
         }
-        for (int pid : previousCgroupCandidates) {
+        std::set<int> knownPids = visiblePids;
+        for (const auto& entry : previous) knownPids.insert(entry.first);
+        for (int pid : knownPids) {
             if (excluded.count(pid) || clocks.count(pid)) continue;
             uint64_t value = 0;
             if (processClock(pid, value)) clocks[pid] = {value, nowNs()};
@@ -839,6 +826,7 @@ int main(int argc, char** argv) {
         for (auto it = previous.begin(); it != previous.end();) {
             if (excluded.count(it->first)) {
                 if (it->second.pidfd >= 0) close(it->second.pidfd);
+                observedPids.erase(it->first);
                 it = previous.erase(it); continue;
             }
             const PidfdPollResult state = it->second.pidfd >= 0 ? pollPidfd(it->second.pidfd) : PidfdPollResult{};
@@ -901,7 +889,25 @@ int main(int argc, char** argv) {
                 : "unverified:" + std::to_string(pid) + ":" + std::to_string(nowNs());
             p.probeState = p.cpu < 0 ? "cpu_baseline" : "deferred_for_audit_budget";
             signalReadings.emplace(pid, cpuSample(p));
-            if ((sample == 0 || p.cpu >= 0.05 || diagnostics) && pid != getpid()) rows.push_back(std::move(p));
+            rows.push_back(std::move(p));
+        }
+        // A visible or held-live PID with an unreadable clock remains present with unknown CPU.
+        for (int pid : knownPids) {
+            if (excluded.count(pid) || clocks.count(pid)) continue;
+            auto found = previous.find(pid);
+            if (found == previous.end()) {
+                if (!visiblePids.count(pid)) continue;
+                Previous observation; observation.epoch = ++epoch;
+                if (caps.pidfd) observation.pidfd = openPidfd(pid);
+                if (observation.pidfd >= 0 && !pidfdLive(observation.pidfd)) { close(observation.pidfd); continue; }
+                found = previous.emplace(pid, observation).first;
+            }
+            Process p; p.pid = pid; p.probeState = "cpu_clock_unavailable";
+            p.identityVerified = found->second.pidfd >= 0;
+            p.identitySource = p.identityVerified ? "held_pidfd" : "unverified";
+            p.identityToken = p.identityVerified ? heldIdentity(pid, found->second.epoch)
+                : "unverified:" + std::to_string(pid) + ":" + std::to_string(found->second.epoch);
+            rows.push_back(std::move(p));
         }
         const auto cpuOrder = [](const Process& a, const Process& b) {
             if (a.cpu != b.cpu) return a.cpu > b.cpu;
@@ -914,13 +920,13 @@ int main(int argc, char** argv) {
         // so their AVC evidence gets first access to the finite kernel audit budget.
         // Baseline rows never generate target metadata denials.
         for (auto& p : rows) {
-            if ((!diagnostics && p.cpu < 0.05) || metadataProbes >= 8) continue;
+            if (excluded.count(p.pid) || (!diagnostics && p.cpu < 0.05) || metadataProbes >= 8) continue;
             auto observation = previous.find(p.pid);
             if (observation == previous.end()) continue;
             if (observation->second.pidfd >= 0 && !pidfdLive(observation->second.pidfd)) continue;
             inspect(p, observation->second, caps);
             environmentObservations.push_back(environmentObservation(p));
-            if (p.uid == int(geteuid())) signalReadings.erase(p.pid);
+            if (p.uid == int(geteuid())) { excluded.insert(p.pid); signalReadings.erase(p.pid); }
             else signalReadings[p.pid] = cpuSample(p);
             ++metadataProbes;
         }
@@ -998,19 +1004,31 @@ int main(int argc, char** argv) {
                     p.uid = evidence.after.uid; p.uidSource = "proc_pid_directory_owner_effective_uid";
                 }
                 if (signalReadings.count(pid)) signalReadings[pid] = cpuSample(p);
-                if (p.uid == int(geteuid())) signalReadings.erase(pid);
             }
             p.cgroupCheck.identityToken = p.identityToken;
         }
-        // Keep current CPU first when the bounded evidence output is full. Java evaluates
-        // all evidence rows before applying its separate display capacity.
+        // Refresh the exclusion set after collection to catch newly created same-UID
+        // processes/tasks, then discard any CPU baselines or events they acquired.
+        std::set<int> visibleAtEnd;
+        const auto ownAtEnd = ownProcesses(appPid, visibleAtEnd);
+        excluded.insert(ownAtEnd.begin(), ownAtEnd.end());
+        for (const auto& p : rows) if (p.uid == int(geteuid())) excluded.insert(p.pid);
+        for (int pid : excluded) {
+            clocks.erase(pid); observedPids.erase(pid);
+            auto observation = previous.find(pid);
+            if (observation != previous.end()) {
+                if (observation->second.pidfd >= 0) close(observation->second.pidfd);
+                previous.erase(observation);
+            }
+        }
+        processEvents.exclude(excluded);
+        // CPU observations are not truncated; only the Activity selects the ten displayed rows.
         std::sort(rows.begin(), rows.end(), cpuOrder);
-        const size_t matched = rows.size();
-        if (rows.size() > candidateLimit) rows.resize(candidateLimit);
         environmentObservations.erase(std::remove_if(environmentObservations.begin(), environmentObservations.end(),
             [&](const EnvironmentObservation& p) {
                 const auto found = previous.find(p.pid);
-                return p.pidfdOpen && (found == previous.end() || found->second.pidfd < 0 || !pidfdLive(found->second.pidfd));
+                return excluded.count(p.pid) || (p.pidfdOpen
+                    && (found == previous.end() || found->second.pidfd < 0 || !pidfdLive(found->second.pidfd)));
             }), environmentObservations.end());
         environment.update(sample, environmentObservations);
         for (auto& p : rows) {
@@ -1032,7 +1050,7 @@ int main(int argc, char** argv) {
         }
         rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const Process& p) {
             const auto found = previous.find(p.pid);
-            return p.uid == int(geteuid()) || found == previous.end()
+            return excluded.count(p.pid) || p.uid == int(geteuid()) || found == previous.end()
                 || (found->second.pidfd >= 0 && !pidfdLive(found->second.pidfd));
         }), rows.end());
         // Drop exits and unavailable epochs after metadata work; never turn their absence into zero.
@@ -1044,7 +1062,7 @@ int main(int argc, char** argv) {
         }
         std::set<int> retainedCgroupCandidates;
         for (const auto& p : rows) if (p.cgroupCheck.state == "MISSING") retainedCgroupCandidates.insert(p.pid);
-        cpuSignals.update(signalReadings, retainedCgroupCandidates);
+        cpuSignals.update(signalReadings);
         previousCgroupCandidates = std::move(retainedCgroupCandidates);
         std::sort(rows.begin(), rows.end(), cpuOrder);
         unsigned unknownUid = 0; for (const auto& p : rows) if (p.uid < 0) ++unknownUid;
@@ -1054,23 +1072,26 @@ int main(int argc, char** argv) {
             << ",\"elapsedMs\":" << (begin - session) / 1000000ULL << ",\"intervalMs\":" << interval << ",\"sampleIndex\":" << sample
             << ",\"collectionMs\":" << (nowNs() - begin) / 1000000ULL << ",\"cpuCores\":" << std::max(1L, sysconf(_SC_NPROCESSORS_ONLN))
             << ",\"scannedProcesses\":" << scanned << ",\"liveClockProcesses\":" << clocks.size() << ",\"deniedProcesses\":" << unknownUid
-            << ",\"scanComplete\":" << (complete && !diagnostics && caps.pidMaxReadable && limit >= caps.pidMax && matched <= candidateLimit)
+            << ",\"scanComplete\":" << (eventRangeComplete && caps.pidMaxReadable && limit >= caps.pidMax)
             << ",\"capabilities\":{\"selfProcessCpuClock\":" << caps.selfClock << ",\"selfProcessCpuClockErrno\":" << caps.selfClockErrno
             << ",\"externalProcessCpuClock\":" << caps.externalClock << ",\"externalProcessCpuClockErrno\":" << caps.externalClockErrno
             << ",\"pidfdOpen\":" << caps.pidfd << ",\"pidfdOpenErrno\":" << caps.pidfdErrno
             << ",\"pidfdCredentials\":" << caps.pidfdUid << ",\"pidfdCredentialsErrno\":" << caps.pidfdInfoErrno
             << ",\"collectorSelinux\":" << q(caps.selinux) << ",\"pidMax\":" << (caps.pidMaxReadable ? std::to_string(caps.pidMax) : "null")
             << ",\"pidMaxReadable\":" << caps.pidMaxReadable << ",\"pidMaxErrno\":" << caps.pidMaxErrno << ",\"pidUpperBound\":" << limit
+            << ",\"pidScanCursorNext\":" << scanCursor
             << ",\"globalGpuMemstore\":" << globalGpu.supported()
             << ",\"metadataProbeLimit\":8,\"metadataProbeOrder\":\"descending_process_cpu\",\"metadataProbeCount\":" << metadataProbes
             << ",\"uidAttribution\":\"readable status, exact proc PID directory owner, or PIDFD_GET_INFO; otherwise unknown\""
             << ",\"gpuAttribution\":\"only readable target GPU descriptors; global activity is never assigned to a PID\"}"
-            << ",\"matchedCandidates\":" << matched << ",\"returnedCandidates\":" << rows.size() << ",\"candidateLimit\":" << candidateLimit << ",\"candidatesTruncated\":" << (matched > candidateLimit)
-            << ",\"cpuSampleCount\":" << cpuSignals.samples.size() << ",\"cpuSamplesTruncated\":" << cpuSignals.truncated
-            << ",\"cpuSampleEligibleCount\":" << cpuSignals.eligibleCount << ",\"cpuSampleCapacityOmissions\":" << cpuSignals.capacityOmissions
-            << ",\"cpuSampleCapacityEvictions\":" << cpuSignals.capacityEvictions << ",\"cpuSampleCapacity\":" << CpuSignalCache::capacity
-            << ",\"cpuSampleIdleRetentionMs\":" << CpuSignalCache::retentionNs / 1000000ULL
-            << ",\"cpuSampleCoverage\":\"bounded observed-active non-self PIDs; measured zero retained for 120 seconds after activity unless capacity-evicted; missing/invalid clocks, exits and identity changes are removed, never zero-filled; current CPU and discounted recent peaks determine admission\""
+            << ",\"matchedCandidates\":" << rows.size() << ",\"returnedCandidates\":" << rows.size() << ",\"candidateLimit\":0,\"candidatesTruncated\":false"
+            << ",\"cpuSampleCount\":" << cpuSignals.samples.size() << ",\"cpuSamplesTruncated\":false"
+            << ",\"cpuSampleEligibleCount\":" << cpuSignals.samples.size() << ",\"cpuSampleCapacityOmissions\":0"
+            << ",\"cpuSampleCapacityEvictions\":0,\"cpuSampleCapacity\":0"
+            << ",\"cpuSampleIdleRetentionMs\":0"
+            << ",\"cpuExcludedPidTidCount\":" << excluded.size() << ",\"cpuExclusionUid\":" << geteuid()
+            << ",\"cpuExclusionScope\":\"app_and_collector_pids_and_same_uid_processes_and_threads\""
+            << ",\"cpuSampleCoverage\":\"all discovered external PIDs including measured zero; App, collector, same-UID processes and their tasks are excluded; no CPU row capacity limit (0 means unlimited); missing/invalid clocks remain unknown, never zero-filled; timed PID sweeps resume next round and known external PIDs are resampled every round; discovery outside the reported range remains uncovered\""
             << ",\"environmentAnomaly\":" << environment.anomaly << ",\"environmentCheckSupported\":" << caps.pidfd
             << ",\"environmentCheckedPidCount\":" << environment.attempted << ",\"environmentLivePidfdCheckCount\":" << environment.livePidfdChecks
             << ",\"environmentCheckCoverage\":\"Reuses at most 8 highest-CPU metadata probes per sample; no additional proc accesses; idle and unselected PIDs are not covered; no observed conflict is not a clean-environment guarantee\""

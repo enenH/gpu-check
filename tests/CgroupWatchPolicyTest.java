@@ -19,6 +19,7 @@ public final class CgroupWatchPolicyTest {
         run("mismatching identity and sample index are rejected", CgroupWatchPolicyTest::mismatch);
         run("same PID duplicates are not counted twice", CgroupWatchPolicyTest::duplicatePid);
         run("application, collector and shared UID are excluded", CgroupWatchPolicyTest::self);
+        run("CPU monitoring excludes self without requiring risk evidence", CgroupWatchPolicyTest::cpuScope);
         run("independent identities retain separate streaks", CgroupWatchPolicyTest::independent);
         run("catalog changes restart confirmation", CgroupWatchPolicyTest::catalogChange);
         run("calibration and coverage failures clear confirmation", CgroupWatchPolicyTest::invalidPaths);
@@ -174,6 +175,15 @@ public final class CgroupWatchPolicyTest {
         check(!MonitoredProcessFilter.accepts(true, true, true), "self admitted by combined filter");
         CgroupWatchPolicy.Decision d = sample(confirmed(), 3, 6000, true, "A", missing(3, "A"), true);
         check(!d.anomaly && d.consecutive == 0 && "EXCLUDED".equals(d.status), "self retained confirmation");
+    }
+
+    private static void cpuScope() {
+        check(MonitoredProcessFilter.acceptsCpu(42, false), "external CPU sample requires risk evidence");
+        check(!MonitoredProcessFilter.acceptsCpu(42, true), "self CPU sample was admitted");
+        check(!MonitoredProcessFilter.acceptsCpu(0, false) && !MonitoredProcessFilter.acceptsCpu(-1, false),
+                "invalid PID was admitted");
+        check(MonitoredProcessFilter.isSelf(42, -1, 42, 43, 10101), "collector with unknown UID leaked");
+        check(MonitoredProcessFilter.isSelf(43, -1, 42, 43, 10101), "App with unknown UID leaked");
     }
 
     private static void independent() {
