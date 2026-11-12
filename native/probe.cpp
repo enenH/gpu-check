@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <vector>
 #include "cgroup_watch.h"
+#include "futex_probe.h"
 
 namespace {
 volatile sig_atomic_t stopped = 0, syscallBlocked = 0;
@@ -257,6 +258,9 @@ struct Process {
     int procDirectoryErrno = -1, statusErrno = -1, statErrno = -1, xattrErrno = -1;
     std::vector<std::string> gpuEvidence, errors;
     cgroup_watch::Check cgroupCheck;
+    futex_probe::Result threadTypeResult;
+    bool threadTypeCalibrated = false, threadTypeLiveBefore = false, threadTypeLiveAfter = false;
+    unsigned threadTypeSample = 0;
 };
 
 // Every current, valid CPU window is retained, including newly idle processes.
@@ -497,7 +501,12 @@ void processJson(std::ostream& out, const Process& p) {
         << ",\"gpuEvidenceReadable\":" << p.gpuReadable << ",\"selinuxContext\":" << q(p.context) << ",\"selinuxRootDomainHint\":" << p.selinuxRootDomainHint
         << ",\"procDirectoryErrno\":" << p.procDirectoryErrno << ",\"statusErrno\":" << p.statusErrno << ",\"statErrno\":" << p.statErrno << ",\"xattrErrno\":" << p.xattrErrno
         << ",\"gpuEvidence\":"; strings(out, p.gpuEvidence); out << ",\"errors\":"; strings(out, p.errors);
-    out << ",\"cgroupCheck\":"; p.cgroupCheck.json(out); out << '}';
+    out << ",\"cgroupCheck\":"; p.cgroupCheck.json(out);
+    out << ",\"threadTypeCheck\":{\"method\":\"futex_trylock_pi\",\"tid\":" << p.pid
+        << ",\"sampleIndex\":" << p.threadTypeSample << ",\"identityToken\":" << q(p.identityToken)
+        << ",\"calibrated\":" << p.threadTypeCalibrated << ",\"pidfdLiveBefore\":" << p.threadTypeLiveBefore
+        << ",\"pidfdLiveAfter\":" << p.threadTypeLiveAfter << ",\"result\":";
+    p.threadTypeResult.json(out); out << "}}";
 }
 
 // Global KGSL memstore observations are deliberately separate from all Process evidence.
@@ -779,6 +788,7 @@ int main(int argc, char** argv) {
     Capabilities caps = capabilities();
     if (caps.pidMaxReadable) limit = explicitPidLimit ? std::min(limit, caps.pidMax) : caps.pidMax;
     GlobalGpu globalGpu;
+    futex_probe::Probe threadProbe(syscallBlocked);
     uint64_t session = nowNs(), epoch = session, nextAt = session;
     std::map<int, Previous> previous;
     CpuSignalCache cpuSignals;
@@ -1053,6 +1063,20 @@ int main(int argc, char** argv) {
             return excluded.count(p.pid) || p.uid == int(geteuid()) || found == previous.end()
                 || (found->second.pidfd >= 0 && !pidfdLive(found->second.pidfd));
         }), rows.end());
+        // Recalibrate every snapshot. Bind each result to the same held-live pidfd
+        // on both sides of the syscall; never cache a classification by numeric PID.
+        threadProbe.calibrate(sample);
+        for (auto& p : rows) {
+            p.threadTypeSample = sample;
+            p.threadTypeCalibrated = threadProbe.available;
+            const auto held = previous.find(p.pid);
+            if (!threadProbe.available || !p.identityVerified || held == previous.end()
+                || held->second.pidfd < 0 || p.identityToken != heldIdentity(p.pid, held->second.epoch)) continue;
+            p.threadTypeLiveBefore = pidfdLive(held->second.pidfd);
+            if (!p.threadTypeLiveBefore) continue;
+            p.threadTypeResult = threadProbe.query(uint32_t(p.pid));
+            p.threadTypeLiveAfter = pidfdLive(held->second.pidfd);
+        }
         // Drop exits and unavailable epochs after metadata work; never turn their absence into zero.
         for (auto it = signalReadings.begin(); it != signalReadings.end();) {
             const auto found = previous.find(it->first);
@@ -1103,6 +1127,7 @@ int main(int argc, char** argv) {
             << ",\"errors\":[]"
             << ",\"environmentChecks\":";
         environment.json(out);
+        out << ",\"futexPi\":"; threadProbe.json(out);
         out << ",\"cgroupScan\":"; cgroupScan.json(out);
         out << ",\"processEvents\":";
         processEvents.json(out);

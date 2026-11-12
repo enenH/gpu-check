@@ -20,7 +20,7 @@
     <string name="candidates_title">CPU 使用率前 10</string>
     <string name="cpu_leaders_title">CPU 排行 · 前 %1$d / 共 %2$d</string>
     <string name="no_monitored_candidates">尚未发现可采样的进程</string>
-    <string name="monitored_candidates_description">排除本应用的进程与线程，持续采样其余可发现进程，按 CPU 从高到低显示前 10 个；未知 CPU 排在末尾。</string>
+    <string name="monitored_candidates_description">排除本应用的进程与线程及已确认的内核线程，持续采样其余可发现进程，按 CPU 从高到低显示前 10 个；未知 CPU 排在末尾。</string>
     <string name="cgroup_check_unavailable">cgroup 路径探测校准不可用</string>
     <string name="cgroup_check_available">cgroup 路径探测可用</string>
     <string name="cgroup_anomaly_title">发现 cgroup 路径异常</string>
@@ -28,9 +28,10 @@
     <string name="cgroup_anomaly_monitoring">cgroup路径未匹配 · 监听中</string>
     <string name="cgroup_anomaly_stable">已连续确认 %1$d 次</string>
     <string name="environment_anomaly">环境异常</string>
-    <string name="environment_anomaly_description">发现 pidfd 存活状态与进程目录可见性冲突；下方可查看依据，root 高风险数独立统计。</string>
+    <string name="environment_anomaly_description">发现进程存在性或 AVC kernel 域与线程类型的证据冲突，点击下方异常卡片查看依据。</string>
     <string name="environment_conflict_summary">pidfd 仍存活，但 /proc/PID 复查返回不存在。冲突 PID：%1$s\n环境一致性异常不表示这些 PID 已确认属于 root。</string>
-    <string name="environment_conflict_details">点击查看 pidfd / stat 原始依据</string>
+    <string name="environment_kernel_domain_summary">AVC 显示 kernel，但线程类型检查确认是用户态线程。冲突 PID：%1$s</string>
+    <string name="environment_conflict_details">点击查看环境异常原始依据</string>
     <string name="lifecycle_association_line">进程启停关联 · %1$s</string>
     <string name="gpu_overlay_confirmed">确认使用gpu悬浮窗</string>
     <string name="overlay_cheat">外挂悬浮窗</string>

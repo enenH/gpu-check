@@ -573,11 +573,13 @@ public final class MainActivity extends Activity {
         }
         JSONArray checks = currentReport.optJSONArray("environmentChecks");
         List<Integer> pids = new ArrayList<>();
+        List<Integer> kernelDomainPids = new ArrayList<>();
         for (int i = 0; checks != null && i < checks.length(); i++) {
             JSONObject check = checks.optJSONObject(i);
             if (check == null || !"ANOMALY".equals(check.optString("status"))) continue;
             int pid = check.optInt("pid", -1);
-            if (pid > 0 && !pids.contains(pid)) pids.add(pid);
+            List<Integer> target = "avc_kernel_userspace".equals(check.optString("type")) ? kernelDomainPids : pids;
+            if (pid > 0 && !target.contains(pid)) target.add(pid);
         }
         Collections.sort(pids);
         StringBuilder names = new StringBuilder();
@@ -585,8 +587,16 @@ public final class MainActivity extends Activity {
             if (names.length() > 0) names.append("、");
             names.append(pid);
         }
-        environmentSummary.setText(getString(R.string.environment_conflict_summary,
-                names.length() == 0 ? "详见原始依据" : names.toString()));
+        String summary = pids.isEmpty() ? "" : getString(R.string.environment_conflict_summary, names.toString());
+        Collections.sort(kernelDomainPids);
+        names.setLength(0);
+        for (int pid : kernelDomainPids) {
+            if (names.length() > 0) names.append("、");
+            names.append(pid);
+        }
+        if (!kernelDomainPids.isEmpty()) summary += (summary.isEmpty() ? "" : "\n\n")
+                + getString(R.string.environment_kernel_domain_summary, names.toString());
+        environmentSummary.setText(summary.isEmpty() ? "详见原始依据" : summary);
         environmentCard.setVisibility(View.VISIBLE);
     }
 
@@ -616,12 +626,14 @@ public final class MainActivity extends Activity {
 
     private void showEnvironmentEvidence() {
         if (currentReport == null || !currentReport.optBoolean("environmentAnomaly")) return;
-        StringBuilder detail = new StringBuilder("同一进程的 pidfd 仍指示存活，但其 /proc/PID 的 stat 连续复查为 ENOENT，产生环境一致性异常。权限拒绝或正常退出不等同于此异常；此检查独立于 root 候选筛选，不证明进程身份或 GPU 使用。\n\n");
+        StringBuilder detail = new StringBuilder("环境异常依据包含两类：同一存活身份的进程目录连续复查为不存在；或 AVC 目标域为 kernel，但经校准的 futex 检查确认是用户态线程。权限拒绝、正常退出和无法判定不作为第二类异常。确认的内核线程已从 CPU 列表排除。\n\n");
         JSONObject raw = new JSONObject();
         try {
             raw.put("environmentAnomaly", currentReport.optBoolean("environmentAnomaly"));
             raw.put("environmentCheckCoverage", currentReport.opt("environmentCheckCoverage"));
             raw.put("environmentChecks", currentReport.optJSONArray("environmentChecks"));
+            raw.put("futexPi", currentReport.optJSONObject("futexPi"));
+            raw.put("kernelThreadExcludedCount", currentReport.optInt("kernelThreadExcludedCount"));
             detail.append(raw.toString(2));
         } catch (JSONException e) {
             detail.append("原始依据无法解析：").append(e.getMessage());
@@ -781,8 +793,9 @@ public final class MainActivity extends Activity {
             String risk = p.optString("risk", "UNKNOWN");
             boolean avcRisk = "avc_root_domain_cpu_global_memstore".equals(p.optString("riskBasis"));
             boolean cgroupAnomaly = p.optBoolean("cgroupAnomaly");
-            int color = "HIGH".equals(risk) ? RED : "SUSPECT".equals(risk) || "WATCH".equals(risk) ? AMBER : MUTED;
-            int nextBackground = "HIGH".equals(risk) ? 1 : "SUSPECT".equals(risk) ? 2 : 0;
+            boolean kernelMismatch = p.optBoolean("kernelDomainMismatch");
+            int color = kernelMismatch || "HIGH".equals(risk) ? RED : "SUSPECT".equals(risk) || "WATCH".equals(risk) ? AMBER : MUTED;
+            int nextBackground = kernelMismatch || "HIGH".equals(risk) ? 1 : "SUSPECT".equals(risk) ? 2 : 0;
             if (nextBackground != backgroundKind) {
                 item.setBackground(nextBackground == 1 ? shape(Color.rgb(43, 30, 35), Color.rgb(111, 54, 65), 16)
                         : nextBackground == 2 ? shape(Color.rgb(43, 37, 27), Color.rgb(98, 80, 48), 16)
@@ -793,7 +806,7 @@ public final class MainActivity extends Activity {
             String processName = p.optString("name", "").trim();
             if (processName.isEmpty()) processName = pidLabel;
             bindText(name, processName);
-            bindText(riskTag, riskName(risk));
+            bindText(riskTag, kernelMismatch ? getString(R.string.environment_anomaly) : riskName(risk));
             bindColor(riskTag, color);
             String identityText = processName.equals(pidLabel) ? "" : pidLabel;
             int uid = p.optInt("uid", -1);
@@ -805,7 +818,9 @@ public final class MainActivity extends Activity {
             if (identity.getVisibility() != identityVisibility) identity.setVisibility(identityVisibility);
             String avcContext = p.optString("avcTargetContext", "");
             boolean showAvcHint = !avcContext.isEmpty();
-            bindText(avcHint, showAvcHint ? "AVC 域 · " + avcContext : "");
+            bindText(avcHint, showAvcHint ? "AVC 域 · " + avcContext
+                    + (kernelMismatch ? "\n线程类型 · 用户态，与 kernel 域不一致" : "") : "");
+            bindColor(avcHint, kernelMismatch ? RED : AMBER);
             int avcVisibility = showAvcHint ? View.VISIBLE : View.GONE;
             if (avcHint.getVisibility() != avcVisibility) avcHint.setVisibility(avcVisibility);
             bindText(cpu, "CPU  " + MainActivity.cpu(p.optDouble("cpuPercent", -1)));
@@ -833,9 +848,11 @@ public final class MainActivity extends Activity {
                 }
                 reason = anomalyReason + "\n" + reason;
             }
+            if (kernelMismatch) reason = "环境异常：AVC 显示 kernel，但线程类型检查确认是用户态线程。\n" + reason;
             bindText(explanation, reason);
-            bindColor(explanation, cgroupAnomaly ? AMBER : MUTED);
+            bindColor(explanation, kernelMismatch ? RED : cgroupAnomaly ? AMBER : MUTED);
             String description = p.optString("name") + "，" + riskName(risk)
+                    + (kernelMismatch ? "，环境异常" : "")
                     + (cgroupAnomaly ? "，" + getString(R.string.cgroup_anomaly_monitoring) : "")
                     + "，点击查看进程证据";
             if (!description.contentEquals(item.getContentDescription() == null ? "" : item.getContentDescription()))
@@ -896,6 +913,12 @@ public final class MainActivity extends Activity {
             detail.append(p.optString("backgroundReason", "")).append("\n\n");
         }
         detail.append("AVC 目标安全上下文：").append(p.optString("avcTargetContext").isEmpty() ? "未知" : p.optString("avcTargetContext")).append('\n');
+        String threadType = p.optString("threadType", KernelThreadPolicy.UNKNOWN);
+        detail.append("线程类型：").append(KernelThreadPolicy.USER.equals(threadType) ? "用户态线程"
+                : KernelThreadPolicy.KERNEL.equals(threadType) ? "内核线程" : "未知").append('\n');
+        if (p.optBoolean("kernelDomainMismatch")) detail.append("环境异常：AVC 的 kernel 域与线程类型检查冲突。\n");
+        JSONObject threadCheck = p.optJSONObject("threadTypeCheck");
+        if (threadCheck != null) detail.append("线程类型检查依据：").append(threadCheck.toString()).append('\n');
         JSONArray avcEvidence = p.optJSONArray("avcEvidence");
         if (avcEvidence != null && avcEvidence.length() > 0) {
             detail.append("原始 AVC 拒绝日志（应用自身可读取）：\n");
@@ -1078,7 +1101,8 @@ public final class MainActivity extends Activity {
         int pid = process.optInt("pid", -1);
         boolean self = MonitoredProcessFilter.isSelf(pid, process.optInt("uid", -1), collectorPid,
                 android.os.Process.myPid(), android.os.Process.myUid());
-        return MonitoredProcessFilter.acceptsCpu(pid, self);
+        return MonitoredProcessFilter.acceptsCpu(pid, self)
+                && !KernelThreadPolicy.KERNEL.equals(process.optString("threadType"));
     }
 
     private String lifecycleSummary(JSONObject lifecycle) {

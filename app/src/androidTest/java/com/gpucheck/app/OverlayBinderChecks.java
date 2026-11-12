@@ -23,6 +23,25 @@ final class OverlayBinderChecks {
         require(hasSuspicious(masked.oplus(() -> false)), "Find random title when all single-character queries are masked");
         binder.mode = "masked_clear";
         require(!hasSuspicious(masked.oplus(() -> false)), "Masked target disappearance clears exact-name revalidation");
+        binder.mode = "vri";
+        JSONObject vri = new LayerProbe("com.gpucheck.app", binder).oplus(() -> false);
+        require(vri.optBoolean("available") && !hasSuspicious(vri), "VRI component must not cause overlay alert");
+        boolean vriObserved = false;
+        for (int i = 0; i < vri.getJSONArray("rows").length(); i++) {
+            JSONObject row = vri.getJSONArray("rows").getJSONObject(i);
+            if (row.optString("name").equals("VRI-com.gpucheck.app/com.gpucheck.app.MainActivity#")) {
+                vriObserved = true;
+                require(row.optString("normalizedName").startsWith("VRI-") && row.optString("reason").contains("已过滤"),
+                        "VRI raw name and explicit exclusion reason retained");
+            }
+        }
+        require(vriObserved, "VRI control actually returned through Binder query");
+        for (String mode : new String[]{"vri_unknown", "vri_keyword"}) {
+            binder.mode = mode;
+            JSONObject filtered = new LayerProbe("com.gpucheck.app", binder).oplus(() -> false);
+            require(filtered.optBoolean("available") && !hasSuspicious(filtered)
+                    && filtered.getJSONArray("rows").length() > 0, "Exclude every VRI prefix: " + mode);
+        }
         for (String mode : new String[]{"mismatch", "unhandled", "denied", "malformed"}) {
             binder.mode = mode;
             JSONObject failed = probe.oplus(() -> false);
@@ -70,7 +89,10 @@ final class OverlayBinderChecks {
                     if (normal.contains(target)) value = normal;
                     else if (mode.equals("masked") && "j2v7random#42".contains(target)) value = "j2v7random#42";
                 }
-                else for (String name : mode.equals("clear") ? new String[]{"StatusBar#1"}
+                else for (String name : mode.equals("vri_unknown") ? new String[]{"VRI-randomOverlay#17"}
+                        : mode.equals("vri_keyword") ? new String[]{"VRI-ImGui#23"} : mode.equals("vri")
+                        ? new String[]{"VRI-com.gpucheck.app/com.gpucheck.app.MainActivity#"}
+                        : mode.equals("clear") ? new String[]{"StatusBar#1"}
                         : new String[]{"StatusBar#1", "q7randomTitle#42"}) {
                     if (name.contains(target)) { value = name; break; }
                 }

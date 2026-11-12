@@ -60,6 +60,10 @@ final class RiskEngine {
                 && cgroupScan.optLong("sampleIndex", -1) == sampleIndex;
         cgroupPolicy.beginSnapshot(sampleIndex, elapsed, cgroupPathMethodAvailable);
         JSONArray input = mergeCurrentCpuRows(report);
+        JSONArray environmentChecks = report.optJSONArray("environmentChecks");
+        if (environmentChecks == null) environmentChecks = new JSONArray();
+        JSONArray excludedKernelThreads = new JSONArray();
+        int kernelDomainMismatches = 0;
         JSONArray nativeEvents = report.optJSONArray("processEvents");
         List<JSONObject> sorted = new ArrayList<>();
         int high = 0;
@@ -79,6 +83,27 @@ final class RiskEngine {
             int pid = p.optInt("pid", -1);
             boolean isSelf = isSelf(p, report);
             if (!MonitoredProcessFilter.acceptsCpu(pid, isSelf) || occurrences.get(pid) != 1) continue;
+            String threadType = KernelThreadPolicy.classify(p, report);
+            boolean kernelDomainMismatch = KernelThreadPolicy.kernelDomainMismatch(p, threadType);
+            p.put("threadType", threadType).put("kernelDomainMismatch", kernelDomainMismatch);
+            if (KernelThreadPolicy.KERNEL.equals(threadType)) {
+                excludedKernelThreads.put(new JSONObject().put("pid", pid)
+                        .put("identityToken", p.optString("identityToken"))
+                        .put("threadTypeCheck", p.optJSONObject("threadTypeCheck")));
+                lifecycle.revoke(pid, p.optString("identityToken"));
+                continue;
+            }
+            if (kernelDomainMismatch) {
+                kernelDomainMismatches++;
+                environmentChecks.put(new JSONObject().put("type", "avc_kernel_userspace")
+                        .put("status", "ANOMALY").put("pid", pid)
+                        .put("identityToken", p.optString("identityToken"))
+                        .put("avcTargetContext", p.optString("avcTargetContext"))
+                        .put("avcEvidenceAgeMs", p.optLong("avcEvidenceAgeMs"))
+                        .put("avcEvidence", p.opt("avcEvidence"))
+                        .put("threadTypeCheck", p.optJSONObject("threadTypeCheck"))
+                        .put("reason", "AVC 目标域为 kernel，但同一存活身份的 futex 检查确认是用户态线程。"));
+            }
             int observedUid = p.optInt("uid", -1);
             String processIdentity = p.optString("identityToken", "");
             CgroupWatchPolicy.Decision cgroup = cgroupPolicy.evaluate(pid, processIdentity,
@@ -282,6 +307,11 @@ final class RiskEngine {
         report.remove("avcRecentEvents");
         String status = errors != null && errors.length() > 0 ? "用户态采集中 · 部分证据受限" : "普通应用权限 · 正在采集";
         report.put("processes", processes).put("highRiskCount", high).put("suspectCount", 0)
+                .put("kernelThreadExcludedCount", excludedKernelThreads.length())
+                .put("excludedKernelThreads", excludedKernelThreads)
+                .put("kernelDomainMismatchCount", kernelDomainMismatches)
+                .put("environmentChecks", environmentChecks)
+                .put("environmentAnomaly", report.optBoolean("environmentAnomaly") || kernelDomainMismatches > 0)
                 .put("rootProcessCount", rootCount).put("rootWatchCount", watching)
                 .put("monitoredProcessCount", sorted.size()).put("cgroupAnomalyCount", cgroupAnomalies)
                 .put("cgroupWatchCount", cgroupWatching)
@@ -299,7 +329,8 @@ final class RiskEngine {
                 .put("sessionStartedAt", sessionStartedAt).put("status", status)
                 .put("rule", "普通权限组合规则：目标 PID 的 AVC 拒绝日志指向 root 执行域、CPU ≥ " + threshold
                         + "% 连续 " + windows + " 次、全局 memstore 连续 " + windows + " 次推进，报告高风险（启发式）。"
-                        + "监听所有可发现的外部进程 CPU，包括普通和零负载进程；排除本应用、采集器、同 UID 进程及其线程，页面仅显示 CPU 排序前 10 个。"
+                        + "监听所有可发现的外部用户态进程 CPU，包括普通和零负载进程；排除本应用、采集器、同 UID 进程及其线程，以及经校准 futex 检查确认的内核线程，页面仅显示 CPU 排序前 10 个。"
+                        + "AVC 目标域为 kernel 而 futex 确认是用户态线程时显示环境异常；检查未知不触发该异常，也不据此排除。"
                         + "有效 UID 0、匹配 root 目标域和连续 3 次 cgroup 命名路径未匹配的证据单独用于风险与 GPU 生命周期观察。"
                         + "命名路径差异不表示进程没有内核 cgroup，不证明 root 身份或 GPU 归属。")
                 .put("gpuEvidenceNote", "全局 GPU 活动单独报告，不分配给高 CPU 进程；普通应用不能读取的身份或设备归属保持未知。")
@@ -380,6 +411,7 @@ final class RiskEngine {
                     if (name.startsWith("avc")) observation.put(name, row.opt(name));
                 }
             }
+            if (row.has("threadTypeCheck")) observation.put("threadTypeCheck", row.optJSONObject("threadTypeCheck"));
             merged.put(observation); presentPids.add(pid); added++;
             if (!isSelf(observation, report) && isRoot(observation)) addedRoots++;
         }

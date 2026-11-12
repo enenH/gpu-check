@@ -23,9 +23,12 @@ final class LayerNamePolicy {
 
     static Decision classify(String raw) {
         if (raw == null || raw.trim().isEmpty()) return new Decision("", false, "empty");
-        if (raw.length() > 8192 || raw.codePoints().anyMatch(c -> Character.isISOControl(c)
-                || Character.getType(c) == Character.FORMAT)) return new Decision(raw, true, "名称包含异常控制字符");
+        if (raw.length() > 8192) return new Decision(raw, true, "名称超出长度限制");
         String name = normalize(raw);
+        // User-selected exclusion applies to every VRI- title, not only components.
+        if (name.startsWith("VRI-")) return new Decision(name, false, "已过滤 VRI- 前缀图层");
+        if (raw.codePoints().anyMatch(c -> Character.isISOControl(c)
+                || Character.getType(c) == Character.FORMAT)) return new Decision(raw, true, "名称包含异常控制字符");
         if (name.isEmpty()) return new Decision("", false, "仅图层编号，未提供可判断的名称");
         String lower = name.toLowerCase(Locale.ROOT);
         if (lower.contains("imgui") || lower.contains("dfm_plus") || lower.contains("aimbot")

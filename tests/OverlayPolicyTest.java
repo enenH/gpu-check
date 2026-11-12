@@ -27,6 +27,23 @@ public final class OverlayPolicyTest {
                 "#55", "#173#174", "[BBQ] #55", "bbq-wrapper #55"})
             check(!LayerNamePolicy.classify(name).suspicious, "explain " + name);
         check(LayerNamePolicy.normalize("[BBQ] aq69gt3janfi#173#174").equals("aq69gt3janfi"), "wrapper deduplication");
+        String ownComponent = "com.gpucheck.app/com.gpucheck.app.MainActivity";
+        for (String name : new String[]{"VRI-" + ownComponent + "#", "VRI-" + ownComponent,
+                "VRI-" + ownComponent + "#123", "[BBQ] VRI-" + ownComponent + "#123#124",
+                "bbq-wrapper VRI-" + ownComponent + "#", "a12bc VRI-" + ownComponent + "#456",
+                "Surface(name=VRI-" + ownComponent + ")/@0x1234 - animation-leash of starting_reveal#7"}) {
+            check(!LayerNamePolicy.classify(name).suspicious, "filter VRI component " + name);
+            check(LayerNamePolicy.normalize(name).startsWith("VRI-"), "retain VRI exclusion prefix " + name);
+        }
+        check(!LayerNamePolicy.classify("VRI-com.example.app/.MainActivity#").suspicious,
+                "VRI exclusion covers other packages");
+        for (String name : new String[]{"VRI-random#", "VRI-com.gpucheck.app#", "VRI-" + ownComponent + "#garbage",
+                "VRI-" + ownComponent + "#12 extra", "VRI-" + ownComponent + "##", "VRI-" + ownComponent + "\u202e#",
+                "VRI-com.example.app/com.example.app.ImGuiActivity#1", "VRI-ImGui#", "VRI-", "VRI-NotificationShade#19",
+                "[BBQ] VRI-random#3#4", "bbq-wrapper VRI-ImGui#23", "VRI-外挂#1", "VRI-VRI-random#5"})
+            check(!LayerNamePolicy.classify(name).suspicious, "filter every VRI title " + name);
+        for (String name : new String[]{"prefix VRI-random#1", "notVRI-random#1", "vri-random#1", "VRI[random]#1", "random#1", "ImGui#1"})
+            check(LayerNamePolicy.classify(name).suspicious, "only the exact leading VRI- prefix is excluded " + name);
         for (boolean utf8 : new boolean[]{false, true}) for (boolean header : new boolean[]{false, true}) {
             for (String value : new String[]{null, "", "StatusBar#5", "悬浮窗😀#42"}) {
                 byte[] bytes = parcel(value, utf8, header);

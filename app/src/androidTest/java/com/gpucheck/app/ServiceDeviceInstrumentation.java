@@ -90,6 +90,13 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                 if (statusLine.startsWith("CapEff:")) summary.put("appCapEff", statusLine.substring(7).trim());
             }
             check(android.os.Process.myUid() >= 10000, "Instrumentation must run as an ordinary App UID");
+            summary.put("kernelThreadRegression", KernelThreadChecks.engine());
+            if (Boolean.parseBoolean(arguments.getString("kernel_checks_only", "false"))) {
+                summary.put("test", "kernel_thread_headless").put("kernelThreadCollector", KernelThreadChecks.collector(getTargetContext()));
+                summary.put("result", "PASS"); result.putString("result", "PASS");
+                resultCode = Activity.RESULT_OK;
+                return;
+            }
             check(getTargetContext().getSystemService(PowerManager.class).isInteractive(), "Screen is not awake");
             check(!getTargetContext().getSystemService(KeyguardManager.class).isKeyguardLocked(), "Screen is locked");
             summary.put("overlayProtocolRegression", OverlayBinderChecks.run());
@@ -101,6 +108,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             activity = (MainActivity) launched;
             waitForIdleSync();
             check(!MonitorService.running && MonitorService.latestReport == null, "Unexpected retained session before start");
+            KernelThreadChecks.ui(this, activity);
             if (Boolean.parseBoolean(arguments.getString("overlay_fixture", "false"))) createOverlayFixture();
             clickStartStop();
             JSONObject first = awaitSamples("first", 2, 20000);
@@ -288,6 +296,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                     "overlay_unavailable_became_stale", "Unavailable protocol was misclassified as stale layer data");
         }
         CgroupWatchInstrumentation.assertSelfExcluded(report, -1);
+        KernelThreadChecks.real(report);
         List<Integer> expectedOrder = validateReportOrder(rows);
         JSONObject frame = new JSONObject().put("phase", phase).put("collectorPid", report.getInt("collectorPid"))
                 .put("sampleIndex", report.getLong("sampleIndex")).put("elapsedMs", report.optLong("elapsedMs"))
