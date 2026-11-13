@@ -26,6 +26,8 @@
 #include <vector>
 #include "cgroup_watch.h"
 #include "futex_probe.h"
+#include "gpu_sample.h"
+#include "metadata_schedule.h"
 
 namespace {
 volatile sig_atomic_t stopped = 0, syscallBlocked = 0;
@@ -251,6 +253,11 @@ struct Process {
     uint64_t start = 0, probeEpochMs = 0, probeEndEpochMs = 0, probeMonotonicNs = 0, probeEndMonotonicNs = 0;
     uint64_t cpuWindowStartNs = 0, cpuWindowEndNs = 0;
     int64_t rssKb = -1, threads = -1; double cpu = -1;
+    std::string selinuxXattrContext, selinuxAttrContext, selinuxIdentityToken;
+    bool selinuxEvidenceVerified = false, selinuxProcfsVerified = false;
+    int64_t selinuxFsType = -1;
+    unsigned selinuxSampleIndex = 0;
+    int attrErrno = -1, selinuxStatfsErrno = -1;
     bool identityVerified = false, gpuDeviceOpen = false, gpuReadable = false, procReadable = false, selinuxRootDomainHint = false;
     bool pidfdOpenedForProbe = false, pidfdAliveBeforeStat = false, pidfdAliveAfterStat = false;
     bool pidfdProcMismatchObserved = false, pidfdProcMismatch = false;
@@ -400,7 +407,8 @@ Capabilities capabilities() {
     Text label = readText("/proc/self/attr/current", 512); if (label.ok) caps.selinux = trim(label.value);
     return caps;
 }
-void inspect(Process& p, Previous& observed, const Capabilities& caps) {
+void inspect(Process& p, Previous& observed, const Capabilities& caps, unsigned sample) {
+    p.selinuxSampleIndex = sample;
     p.probeEpochMs = nowNs(CLOCK_REALTIME) / 1000000ULL;
     p.probeMonotonicNs = nowNs();
     p.probeState = "attempted";
@@ -454,11 +462,28 @@ void inspect(Process& p, Previous& observed, const Capabilities& caps) {
     } else if (group.ok && p.procReadable && fields.tty == 0 && !p.exe.empty() && p.exe[0] == '/' && p.exe.find("/app_process") == std::string::npos) {
         p.background = "background"; p.backgroundReason = "inferred native executable without controlling terminal; Activity visibility not established";
     }
+    // Keep independent channels, including failures. A failed read is unknown,
+    // never a clean label. Verify filesystem provenance before admitting labels.
+    struct statfs labelFs{};
+    const int labelFsResult = ::statfs(base.c_str(), &labelFs);
+    p.selinuxStatfsErrno = labelFsResult ? errno : 0;
+    if (!labelFsResult) p.selinuxFsType = int64_t(labelFs.f_type);
+    p.selinuxProcfsVerified = !labelFsResult && uint64_t(labelFs.f_type) == 0x9fa0;
     Text xattr = selinuxXattr(base); p.xattrErrno = xattr.error;
-    if (xattr.ok) p.context = xattr.value;
-    if (p.context.empty()) { Text attr = readText(base + "/attr/current", 512); if (attr.ok) p.context = trim(attr.value); }
-    for (const std::string hint : {":su:", ":magisk:", ":zygisk:", ":ksu:"})
-        if (p.context.find(hint) != std::string::npos) p.selinuxRootDomainHint = true;
+    Text attr = readText(base + "/attr/current", 513); p.attrErrno = attr.error;
+    if (xattr.ok) p.selinuxXattrContext = xattr.value;
+    if (attr.ok && attr.value.size() <= 512) p.selinuxAttrContext = trim(attr.value);
+    else if (attr.ok) p.attrErrno = EOVERFLOW;
+    p.context = !p.selinuxAttrContext.empty() ? p.selinuxAttrContext : p.selinuxXattrContext;
+    bool labelIdentityStable = false;
+    if (observed.pidfd >= 0) {
+        labelIdentityStable = p.pidfdAliveBeforeStat && p.pidfdAliveAfterStat && pidfdLive(observed.pidfd);
+    } else if (p.procReadable) {
+        const Text afterLabel = readText(base + "/stat"); StatFields afterFields;
+        labelIdentityStable = afterLabel.ok && parseStat(afterLabel.value, afterFields) && afterFields.start == p.start;
+    }
+    p.selinuxEvidenceVerified = p.selinuxProcfsVerified && labelIdentityStable && p.identityVerified;
+    if (p.selinuxEvidenceVerified) p.selinuxIdentityToken = p.identityToken;
     DIR* fds = opendir((base + "/fd").c_str());
     if (fds) {
         p.gpuReadable = true; unsigned visited = 0;
@@ -499,6 +524,11 @@ void processJson(std::ostream& out, const Process& p) {
         << ",\"rssKb\":" << p.rssKb << ",\"threads\":" << p.threads << ",\"background\":" << q(p.background) << ",\"backgroundReason\":" << q(p.backgroundReason)
         << ",\"gpuDeviceOpen\":" << p.gpuDeviceOpen << ",\"gpuActive\":false,\"gpuCountersAvailable\":false,\"gpuScanComplete\":" << p.gpuReadable
         << ",\"gpuEvidenceReadable\":" << p.gpuReadable << ",\"selinuxContext\":" << q(p.context) << ",\"selinuxRootDomainHint\":" << p.selinuxRootDomainHint
+        << ",\"selinuxXattrContext\":" << q(p.selinuxXattrContext) << ",\"selinuxAttrContext\":" << q(p.selinuxAttrContext)
+        << ",\"selinuxIdentityToken\":" << q(p.selinuxIdentityToken) << ",\"selinuxEvidenceVerified\":" << p.selinuxEvidenceVerified
+        << ",\"selinuxProcfsVerified\":" << p.selinuxProcfsVerified << ",\"selinuxSampleIndex\":" << p.selinuxSampleIndex
+        << ",\"selinuxFsType\":" << p.selinuxFsType
+        << ",\"selinuxStatfsErrno\":" << p.selinuxStatfsErrno << ",\"selinuxAttrErrno\":" << p.attrErrno
         << ",\"procDirectoryErrno\":" << p.procDirectoryErrno << ",\"statusErrno\":" << p.statusErrno << ",\"statErrno\":" << p.statErrno << ",\"xattrErrno\":" << p.xattrErrno
         << ",\"gpuEvidence\":"; strings(out, p.gpuEvidence); out << ",\"errors\":"; strings(out, p.errors);
     out << ",\"cgroupCheck\":"; p.cgroupCheck.json(out);
@@ -516,36 +546,7 @@ struct KgslProperty { uint32_t type, pad; uint64_t value, size; };
 struct KgslShadow { uint64_t offset, size; uint32_t flags, pad; };
 static_assert(sizeof(KgslProperty) == 24 && sizeof(KgslShadow) == 24);
 
-// These are conservative data-quality bounds, not a measured GPU throughput limit.
-// A plausible uint32 wrap requires both values to lie within the current allowed
-// increment of the rollover boundary. Even that cannot prove a slot was not reused.
-constexpr uint64_t kSlotMaxRatePerSecond = 1000000ULL;
-constexpr uint64_t kSlotMaxIncrement = 1ULL << 24;
-constexpr uint64_t kSlotMinAllowance = 1024ULL;
-constexpr uint64_t kSlotMaxIntervalNs = 60000000000ULL;
-uint64_t slotDeltaAllowance(uint64_t intervalNs) {
-    if (!intervalNs || intervalNs > kSlotMaxIntervalNs) return 0;
-    const uint64_t rateAllowance = (intervalNs * kSlotMaxRatePerSecond + 999999999ULL) / 1000000000ULL;
-    return std::min(kSlotMaxIncrement, std::max(kSlotMinAllowance, rateAllowance));
-}
-int64_t comparableSlotDelta(uint32_t before, uint32_t after, bool previouslyPresent,
-                           bool currentlyPresent, uint64_t intervalNs, bool& wrapped) {
-    wrapped = false;
-    const uint64_t allowance = slotDeltaAllowance(intervalNs);
-    // A first appearance or disappearance starts a new comparison epoch for this slot.
-    if (!allowance || previouslyPresent != currentlyPresent) return -1;
-    if (after >= before) {
-        const uint64_t delta = uint64_t(after) - before;
-        return delta <= allowance ? int64_t(delta) : -1;
-    }
-    const uint64_t delta = (uint64_t(UINT32_MAX) + 1ULL - before) + after;
-    const uint64_t highBoundary = uint64_t(UINT32_MAX) + 1ULL - allowance;
-    if (uint64_t(before) >= highBoundary && uint64_t(after) < allowance && delta <= allowance) {
-        wrapped = true;
-        return int64_t(delta);
-    }
-    return -1; // ordinary rollback/reset, ambiguous reuse, or unreasonable jump
-}
+using namespace gpu_sample;
 
 class GlobalGpu {
     int fd = -1;
@@ -588,7 +589,7 @@ public:
         const uint64_t now = nowNs();
         const bool sampled = supported() && previous.size() == slots && lastTime > 0;
         const uint64_t intervalNs = sampled && now > lastTime ? now - lastTime : 0;
-        unsigned observed = 0, advanced = 0;
+        unsigned observed = 0;
         unsigned invalidDeltas = 0, wrappedDeltas = 0;
         std::vector<uint32_t> current;
         std::vector<bool> currentPresent;
@@ -605,8 +606,6 @@ public:
                 const bool present = submitted || retired;
                 if (present) ++observed;
                 if (sampled) {
-                    const uint32_t delta = retired - previous[i];
-                    if (delta > 0 && delta < 0x80000000U) ++advanced;
                     if (previousPresent.size() == slots) {
                         if (!previousPresent[i] && present) appearedSlots.push_back(i);
                         if (previousPresent[i] && !present) disappearedSlots.push_back(i);
@@ -622,9 +621,13 @@ public:
             }
         }
         const uint64_t readEnd = nowNs();
-        out << "{\"supported\":" << supported() << ",\"sampled\":" << sampled << ",\"active\":" << (sampled && advanced > 0)
+        const Activity activity = summarize(deltas);
+        out << "{\"supported\":" << supported() << ",\"sampled\":" << sampled << ",\"active\":" << (sampled && activity.active())
             << ",\"source\":\"kgsl_memstore\",\"scope\":\"device_global_unattributed\",\"observedSlots\":" << observed
-            << ",\"advancedSlots\":" << advanced << ",\"monitoredSlots\":" << slots << ",\"intervalMs\":" << intervalNs / 1000000ULL
+            << ",\"activityKnown\":" << (sampled && activity.known())
+            << ",\"comparableSlots\":" << activity.comparableSlots
+            << ",\"activityBasis\":\"validated_slot_deltas\""
+            << ",\"advancedSlots\":" << activity.advancedSlots << ",\"monitoredSlots\":" << slots << ",\"intervalMs\":" << intervalNs / 1000000ULL
             << ",\"intervalNs\":" << intervalNs << ",\"sampleMonotonicNs\":" << now
             << ",\"readEndMonotonicNs\":" << readEnd
             << ",\"slotStrideBytes\":40,\"layoutAssumption\":\"bounded KGSL DEVICE_SHADOW with known 40-byte slot layout\",\"includesInternalAndReusedSlots\":true"
@@ -793,6 +796,7 @@ int main(int argc, char** argv) {
     std::map<int, Previous> previous;
     CpuSignalCache cpuSignals;
     EnvironmentChecks environment;
+    metadata_schedule::Schedule metadataSchedule;
     ProcessEventBatch processEvents;
     std::set<int> observedPids;
     std::set<int> previousCgroupCandidates;
@@ -926,15 +930,21 @@ int main(int argc, char** argv) {
         std::sort(rows.begin(), rows.end(), cpuOrder);
         unsigned metadataProbes = 0;
         std::vector<EnvironmentObservation> environmentObservations;
-        // Probe the highest CPU candidates before the broad cgroup /proc checks,
-        // so their AVC evidence gets first access to the finite kernel audit budget.
-        // Baseline rows never generate target metadata denials.
-        for (auto& p : rows) {
-            if (excluded.count(p.pid) || (!diagnostics && p.cpu < 0.05) || metadataProbes >= 8) continue;
-            auto observation = previous.find(p.pid);
-            if (observation == previous.end()) continue;
+        std::vector<metadata_schedule::Candidate> metadataCandidates;
+        std::map<int, size_t> metadataRows;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& p = rows[i]; const auto observation = previous.find(p.pid);
+            if (excluded.count(p.pid) || observation == previous.end()) continue;
+            metadataCandidates.push_back({p.pid, observation->second.epoch, p.cpu});
+            metadataRows.emplace(p.pid, i);
+        }
+        const auto metadataSelected = metadataSchedule.select(metadataCandidates);
+        // Fair slots run first. CPU priority cannot consume their audit budget.
+        for (int pid : metadataSelected) {
+            auto& p = rows[metadataRows.at(pid)];
+            auto observation = previous.find(pid);
             if (observation->second.pidfd >= 0 && !pidfdLive(observation->second.pidfd)) continue;
-            inspect(p, observation->second, caps);
+            inspect(p, observation->second, caps, sample);
             environmentObservations.push_back(environmentObservation(p));
             if (p.uid == int(geteuid())) { excluded.insert(p.pid); signalReadings.erase(p.pid); }
             else signalReadings[p.pid] = cpuSample(p);
@@ -1105,7 +1115,10 @@ int main(int argc, char** argv) {
             << ",\"pidMaxReadable\":" << caps.pidMaxReadable << ",\"pidMaxErrno\":" << caps.pidMaxErrno << ",\"pidUpperBound\":" << limit
             << ",\"pidScanCursorNext\":" << scanCursor
             << ",\"globalGpuMemstore\":" << globalGpu.supported()
-            << ",\"metadataProbeLimit\":8,\"metadataProbeOrder\":\"descending_process_cpu\",\"metadataProbeCount\":" << metadataProbes
+            << ",\"metadataProbeLimit\":8,\"metadataProbeFairSlots\":4,\"metadataProbeCohortSamples\":2"
+            << ",\"metadataProbeOrder\":\"rotating_identity_cohorts_then_cpu\",\"metadataProbeCount\":" << metadataProbes
+            << ",\"metadataProbeEligible\":" << metadataCandidates.size()
+            << ",\"metadataProbeDeferred\":" << (metadataCandidates.size() - metadataProbes)
             << ",\"uidAttribution\":\"readable status, exact proc PID directory owner, or PIDFD_GET_INFO; otherwise unknown\""
             << ",\"gpuAttribution\":\"only readable target GPU descriptors; global activity is never assigned to a PID\"}"
             << ",\"matchedCandidates\":" << rows.size() << ",\"returnedCandidates\":" << rows.size() << ",\"candidateLimit\":0,\"candidatesTruncated\":false"
@@ -1118,7 +1131,7 @@ int main(int argc, char** argv) {
             << ",\"cpuSampleCoverage\":\"all discovered external PIDs including measured zero; App, collector, same-UID processes and their tasks are excluded; no CPU row capacity limit (0 means unlimited); missing/invalid clocks remain unknown, never zero-filled; timed PID sweeps resume next round and known external PIDs are resampled every round; discovery outside the reported range remains uncovered\""
             << ",\"environmentAnomaly\":" << environment.anomaly << ",\"environmentCheckSupported\":" << caps.pidfd
             << ",\"environmentCheckedPidCount\":" << environment.attempted << ",\"environmentLivePidfdCheckCount\":" << environment.livePidfdChecks
-            << ",\"environmentCheckCoverage\":\"Reuses at most 8 highest-CPU metadata probes per sample; no additional proc accesses; idle and unselected PIDs are not covered; no observed conflict is not a clean-environment guarantee\""
+            << ",\"environmentCheckCoverage\":\"Reuses at most 8 metadata probes per sample: 4 rotating slots repeated for 2 samples plus CPU priority; includes idle and unknown-CPU identities; unselected PIDs remain untested this round; stable sets receive a rotating visit within 2*ceil(N/4) samples; no observed conflict is not a clean-environment guarantee\""
             << ",\"environmentCheckCondition\":\"Only a held pidfd alive before and after stat(/proc/PID), with ENOENT or ESRCH in at least 2 consecutive samples of the same identityToken, confirms an existence-view inconsistency. EACCES/EPERM, exit, unsupported pidfd, recovery, identity changes and skipped samples do not confirm it. CPU-clock success is never substituted for pidfd evidence\""
             << ",\"processEventCount\":" << processEvents.size() << ",\"processEventsTruncated\":" << processEvents.truncated
             << ",\"processEventLimit\":" << ProcessEventBatch::capacity << ",\"processEventPreviousRangeComplete\":" << previousRangeComplete

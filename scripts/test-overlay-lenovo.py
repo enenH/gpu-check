@@ -101,8 +101,8 @@ assert fixture['absentFromFreshCollection'] and not fixture['targetNameSuppliedT
 assert fixture['firstHit']['route'] == 'zui' and fixture['firstHit']['suspicious']
 assert fixture['firstHit']['ownerPid'] == summary['appPid'] and fixture['firstHit']['ownerUid'] == summary['appUid']
 assert name in fixture['hitUi']['overlayNames']
-assert fixture['hitUi']['overlayStatus'] == '外挂悬浮窗'
-assert fixture['hitUi']['overlayColor'] == -34947
+assert fixture['hitUi']['overlayStatus'] == '可疑图层名称 · 待核实'
+assert fixture['hitUi']['overlayColor'] == 0xFFFFCA79 - (1 << 32)  # amber evidence hint
 assert name in (out / 'fixture-detected-surfaceflinger.txt').read_text(encoding='utf8', errors='replace')
 assert name not in (out / 'fixture-disappeared-surfaceflinger.txt').read_text(encoding='utf8', errors='replace')
 states, collections = {}, {}

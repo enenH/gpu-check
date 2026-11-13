@@ -10,8 +10,18 @@ public final class RootProcessFilter {
     // Exact user, role and type fields; optional MLS categories/range have structural validation.
     private static final Pattern ROOT_TARGET_CONTEXT = Pattern.compile(
             "u:r:(?:su|magisk|zygisk|ksu):" + LEVEL + "(?:-" + LEVEL + ")?");
+    private static final Pattern PROCESS_CONTEXT = Pattern.compile(
+            "u:r:[a-zA-Z0-9_]+:" + LEVEL + "(?:-" + LEVEL + ")?");
 
     private RootProcessFilter() { }
+
+    public static boolean validContext(String context) {
+        return context != null && context.length() <= 4096 && PROCESS_CONTEXT.matcher(context).matches();
+    }
+
+    public static boolean rootContext(String context) {
+        return context != null && context.length() <= 4096 && ROOT_TARGET_CONTEXT.matcher(context).matches();
+    }
 
     /**
      * AvcEvidence must establish target-PID association and freshness before calling.
@@ -27,7 +37,6 @@ public final class RootProcessFilter {
                 || identityToken.trim().isEmpty() || !identityToken.equals(avcIdentityToken)) {
             return false;
         }
-        return avcTargetContext != null && avcTargetContext.length() <= 4096
-                && ROOT_TARGET_CONTEXT.matcher(avcTargetContext).matches();
+        return rootContext(avcTargetContext);
     }
 }

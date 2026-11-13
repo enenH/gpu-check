@@ -385,7 +385,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
     private void advanceOverlayFixture() throws Exception {
         if (overlayFixture == null || fixtureHitAt == 0 || SystemClock.elapsedRealtime() - fixtureHitAt < 2500) return;
         JSONObject ui = captureUi();
-        check(ui.optBoolean("overlaySuspected") && "外挂悬浮窗".equals(ui.optString("overlayStatus")), "Fixture did not reach real red UI");
+        check(ui.optBoolean("overlaySuspected") && getTargetContext().getString(R.string.overlay_cheat).equals(ui.optString("overlayStatus")), "Fixture did not reach the real evidence UI");
         check(ui.optString("overlayNames").contains(overlayFixtureName), "Real UI does not show the fixture name");
         summary.getJSONObject("overlayFixture").put("hitUi", ui);
         screenshot("overlay-fixture-hit.png");
@@ -448,11 +448,11 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             TextView overlayNames = (TextView) field("overlayNames");
             JSONObject overlay = shown == null ? null : shown.optJSONObject("overlay");
             boolean suspected = overlay != null && overlay.optBoolean("suspected");
-            validation("外挂悬浮窗".contentEquals(overlayLabel.getText()) == suspected,
+            validation(getTargetContext().getString(R.string.overlay_cheat).contentEquals(overlayLabel.getText()) == suspected,
                     "overlay_label", "Overlay label does not match the displayed report");
-            if (suspected) validation(overlayLabel.getCurrentTextColor() == android.graphics.Color.rgb(255, 119, 125)
+            if (suspected) validation(overlayLabel.getCurrentTextColor() == android.graphics.Color.rgb(255, 202, 121)
                             && overlayNames.getVisibility() == View.VISIBLE && overlayNames.length() > 0,
-                    "overlay_red", "Overlay alert is not red or lacks names");
+                    "overlay_evidence", "Overlay evidence is not amber or lacks names");
             result.set(new JSONObject().put("renderedReportPresent", shown != null)
                     .put("hasRealSample", shown != null && shown.has("sampleIndex"))
                     .put("sampleIndex", shown == null ? -1 : shown.optLong("sampleIndex", -1))
