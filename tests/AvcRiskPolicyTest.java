@@ -205,7 +205,7 @@ public final class AvcRiskPolicyTest {
         candidate(policy, 60);
         AvcRiskPolicy.Decision decision = candidate(policy, 60);
         expect(decision, "HIGH", 3);
-        check(("AVC 指向 root 执行域 + CPU 持续高占用 + 全局 memstore 持续推进；"
+        check(("SELinux 证据指向 root 执行域 + CPU 持续高占用 + 全局 memstore 持续推进；"
                 + "按进程 GPU 归属未确认。").equals(decision.reason), "HIGH reason changed evidence scope");
         check(!decision.reason.contains("UID 0"), "AVC domain must not become numeric UID confirmation");
         check(!decision.reason.contains("已验证 GPU"), "global activity must not become PID GPU proof");

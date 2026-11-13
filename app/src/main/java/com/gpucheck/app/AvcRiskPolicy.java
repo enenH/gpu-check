@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Combines a caller-validated, unexpired AVC domain hint with independent CPU
+ * Combines a caller-validated, unexpired SELinux domain evidence with independent CPU
  * and global GPU observations. It never establishes a numeric UID or PID GPU ownership.
  */
 public final class AvcRiskPolicy {
@@ -76,7 +76,7 @@ public final class AvcRiskPolicy {
         }
         histories.put(pid, new History(identity, count, window));
 
-        if (isSelf) return new Decision("LOW", 0, "本应用进程，不纳入 AVC 组合风险规则。");
+        if (isSelf) return new Decision("LOW", 0, "本应用进程，不纳入 SELinux 组合风险规则。");
         if (!valid) {
             return new Decision("UNKNOWN", 0, "CPU 或进程身份基线无效，无法确认持续性；" + UNATTRIBUTED);
         }
@@ -84,13 +84,13 @@ public final class AvcRiskPolicy {
             return new Decision("LOW", 0, "CPU 未达到阈值，不满足组合风险规则；" + UNATTRIBUTED);
         }
         if (!rootDomainEvidence) {
-            return new Decision("WATCH", count, "缺少当前有效且关联本进程的 root 执行域 AVC 证据；" + UNATTRIBUTED);
+            return new Decision("WATCH", count, "缺少当前有效且关联本进程的 root 执行域证据；" + UNATTRIBUTED);
         }
         if (count >= windows && gpuStreak >= windows) {
             return new Decision("HIGH", count,
-                    "AVC 指向 root 执行域 + CPU 持续高占用 + 全局 memstore 持续推进；按进程 GPU 归属未确认。");
+                    "SELinux 证据指向 root 执行域 + CPU 持续高占用 + 全局 memstore 持续推进；按进程 GPU 归属未确认。");
         }
-        return new Decision("WATCH", count, "AVC 指向 root 执行域，等待持续采样：CPU "
+        return new Decision("WATCH", count, "SELinux 证据指向 root 执行域，等待持续采样：CPU "
                 + count + "/" + windows + "，全局 memstore " + gpuStreak + "/" + windows + "；" + UNATTRIBUTED);
     }
 

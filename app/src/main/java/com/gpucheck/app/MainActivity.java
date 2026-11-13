@@ -21,12 +21,15 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.text.SimpleDateFormat;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -37,6 +40,7 @@ import java.util.Objects;
 /** A local-only dashboard. Every risk label comes from the monitor's measured report. */
 public final class MainActivity extends Activity {
     static final int MAX_DISPLAYED_PROCESSES = 10;
+    private static final int EXPORT_REPORT = 81;
     private static final int BG = Color.rgb(10, 20, 25);
     private static final int SURFACE = Color.rgb(18, 35, 43);
     private static final int BORDER = Color.rgb(38, 65, 74);
@@ -65,6 +69,9 @@ public final class MainActivity extends Activity {
     private TextView overlayNames;
     private LinearLayout overlayCard;
     private Button startButton;
+    private Button exportButton;
+    // Frozen before the picker opens; leaving this screen still stops collection.
+    private String pendingExport;
     private LinearLayout processList;
     private final List<ProcessRow> processRows = new ArrayList<>();
     private LinearLayout emptyProcessCard;
@@ -94,6 +101,8 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         MonitorService.clearPreviousResults(this);
+        Object retained = getLastNonConfigurationInstance();
+        if (retained instanceof String) pendingExport = (String) retained;
         buildUi();
         renderLatest();
     }
@@ -124,6 +133,61 @@ public final class MainActivity extends Activity {
             updateOverlayStatus();
         }
         super.onStop();
+    }
+
+    @Override public Object onRetainNonConfigurationInstance() {
+        return pendingExport;
+    }
+
+    private void exportReport() {
+        if (pendingExport != null) return;
+        try {
+            pendingExport = ReportExport.snapshot(currentReport, System.currentTimeMillis());
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("application/json")
+                    .putExtra(Intent.EXTRA_TITLE, "gpu-check-"
+                            + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date()) + ".json");
+            exportButton.setEnabled(false);
+            startActivityForResult(intent, EXPORT_REPORT);
+        } catch (Exception error) {
+            pendingExport = null;
+            updateExportButton();
+            Toast.makeText(this, "无法导出：" + error.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void updateExportButton() {
+        if (exportButton != null) exportButton.setEnabled(pendingExport == null
+                && currentReport != null && currentReport.optLong("sampleIndex", -1) >= 0);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != EXPORT_REPORT) return;
+        final String snapshot = pendingExport;
+        pendingExport = null;
+        updateExportButton();
+        if (resultCode != RESULT_OK) return;
+        if (snapshot == null || data == null || data.getData() == null) {
+            Toast.makeText(this, "导出快照已失效，请重新检测后导出", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final android.net.Uri destination = data.getData();
+        final android.content.Context context = getApplicationContext();
+        new Thread(() -> {
+            String message;
+            try (OutputStream output = context.getContentResolver().openOutputStream(destination, "wt")) {
+                if (output == null) throw new java.io.IOException("无法打开所选文件");
+                output.write(snapshot.getBytes(StandardCharsets.UTF_8));
+                message = "完整检测快照已导出";
+            } catch (Exception error) {
+                message = "导出失败：" + error.getMessage();
+            }
+            final String result = message;
+            new Handler(Looper.getMainLooper()).post(() ->
+                    Toast.makeText(context, result, Toast.LENGTH_LONG).show());
+        }, "report-export").start();
     }
 
     private void buildUi() {
@@ -232,6 +296,11 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, dp(48));
         startParams.topMargin = dp(14);
         page.addView(startButton, startParams);
+        exportButton = button("导出完整检测快照", false);
+        exportButton.setEnabled(false);
+        exportButton.setOnClickListener(v -> exportReport());
+        marginAdd(page, exportButton, 8);
+        marginAdd(page, label("导出包含全部已采样进程、名称及原始证据；选择保存位置时将停止检测。", 11, MUTED, false), 6);
         errorText = label("", 12, AMBER, false);
         errorText.setLineSpacing(dp(3), 1f);
         errorText.setVisibility(View.GONE);
@@ -450,10 +519,11 @@ public final class MainActivity extends Activity {
     }
 
     private void updateOverlayStatus() {
+        updateExportButton();
         JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
         boolean suspicious = overlay != null && overlay.optBoolean("suspected");
-        overlayStatus.setTextColor(suspicious ? RED : MUTED);
-        overlayCard.setBackground(shape(suspicious ? Color.rgb(43, 30, 35) : SURFACE, suspicious ? RED : BORDER, 16));
+        overlayStatus.setTextColor(suspicious ? AMBER : MUTED);
+        overlayCard.setBackground(shape(suspicious ? Color.rgb(43, 37, 27) : SURFACE, suspicious ? AMBER : BORDER, 16));
         overlayNames.setText("");
         overlayNames.setVisibility(View.GONE);
         if (suspicious) {
@@ -467,7 +537,7 @@ public final class MainActivity extends Activity {
                 text.append(displayLayerName(row.optString("name")));
             }
             if (names != null && names.length() > 3) text.append("\n另有 ").append(names.length() - 3).append(" 个可疑名称");
-            text.append("\n点击查看名称与判断依据");
+            text.append("\n仅名称线索，未确认恶意行为；点击查看依据");
             overlayNames.setText(text);
             overlayNames.setVisibility(View.VISIBLE);
         } else if (!MonitorService.running) overlayStatus.setText("悬浮窗检测 · 等待开始");
@@ -558,6 +628,9 @@ public final class MainActivity extends Activity {
             globalGpuStatus.setTextColor(MUTED);
         } else if (!global.optBoolean("sampled")) {
             globalGpuStatus.setText(R.string.global_gpu_baseline);
+            globalGpuStatus.setTextColor(MUTED);
+        } else if (!global.optBoolean("activityKnown", true)) {
+            globalGpuStatus.setText(R.string.global_gpu_invalid);
             globalGpuStatus.setTextColor(MUTED);
         } else {
             globalGpuStatus.setText(global.optBoolean("active") ? R.string.global_gpu_active : R.string.global_gpu_quiet);
@@ -817,9 +890,14 @@ public final class MainActivity extends Activity {
             int identityVisibility = identityText.isEmpty() ? View.GONE : View.VISIBLE;
             if (identity.getVisibility() != identityVisibility) identity.setVisibility(identityVisibility);
             String avcContext = p.optString("avcTargetContext", "");
-            boolean showAvcHint = !avcContext.isEmpty();
-            bindText(avcHint, showAvcHint ? "AVC 域 · " + avcContext
-                    + (kernelMismatch ? "\n线程类型 · 用户态，与 kernel 域不一致" : "") : "");
+            String directContext = p.optString("domainEvidenceSource").startsWith("direct")
+                    ? p.optString("domainEvidenceContext") : "";
+            boolean domainConflict = "CONFLICT".equals(p.optString("domainEvidenceState"));
+            boolean showAvcHint = !avcContext.isEmpty() || !directContext.isEmpty() || domainConflict;
+            String domainText = domainConflict ? "SELinux 来源不一致 · 等待复查"
+                    : !directContext.isEmpty() ? "直接读取执行域 · " + directContext
+                    : !avcContext.isEmpty() ? "AVC 域 · " + avcContext : "";
+            bindText(avcHint, domainText + (kernelMismatch ? "\n线程类型 · 用户态，与 kernel 域不一致" : ""));
             bindColor(avcHint, kernelMismatch ? RED : AMBER);
             int avcVisibility = showAvcHint ? View.VISIBLE : View.GONE;
             if (avcHint.getVisibility() != avcVisibility) avcHint.setVisibility(avcVisibility);
@@ -833,13 +911,13 @@ public final class MainActivity extends Activity {
             JSONObject lifecycle = p.optJSONObject("cpuGpuLifecycle");
             boolean onsetMatch = lifecycle != null && "ONSET_MATCH".equals(lifecycle.optString("state"));
             bindText(lifecycleLine, getString(R.string.lifecycle_association_line, lifecycleSummary(lifecycle)));
-            bindColor(lifecycleLine, onsetMatch ? RED : MUTED);
+            bindColor(lifecycleLine, onsetMatch ? AMBER : MUTED);
             int lifecycleVisibility = isRootCandidate(p) || cgroupAnomaly ? View.VISIBLE : View.GONE;
             if (lifecycleLine.getVisibility() != lifecycleVisibility) lifecycleLine.setVisibility(lifecycleVisibility);
-            String reason = avcRisk ? "AVC 指向 root 执行域、CPU 持续高占用且全局 GPU 计数推进，触发组合风险告警。"
+            String reason = avcRisk ? "AVC 指向 root 执行域、CPU 持续高占用且全局 GPU 计数推进。组合风险线索，按进程 GPU 归属未确认。"
                     : cgroupAnomaly && !isRootCandidate(p) ? getString(R.string.cgroup_anomaly_description)
                     : p.optString("reason", "等待进一步采样");
-            reason = reason.replace("按进程 GPU 归属未确认。", "").trim();
+            reason = reason.trim();
             if (cgroupAnomaly) {
                 String anomalyReason = getString(R.string.cgroup_anomaly_monitoring);
                 JSONObject watch = p.optJSONObject("cgroupWatch");
@@ -882,7 +960,16 @@ public final class MainActivity extends Activity {
                 && (p.optBoolean("avcRootDomainHint") || "avc_root_domain_cpu_global_memstore".equals(p.optString("riskBasis")))) {
             uidIdentity = "AVC 目标域为 " + avcDomain(p) + "（域证据），有效 UID 未读取";
         }
+        if (uid < 0 && p.optBoolean("domainEvidenceRoot") && isRootCandidate(p)) {
+            uidIdentity = "SELinux 执行域 " + p.optString("domainEvidenceContext") + "（域证据），有效 UID 未读取";
+        }
         if (!uidIdentity.isEmpty()) detail.append("进程身份依据：").append(uidIdentity).append('\n');
+        detail.append("SELinux 交叉验证：").append(p.optString("domainEvidenceState", "UNKNOWN"))
+                .append(" · ").append(p.optString("domainEvidenceSource", "none")).append('\n');
+        detail.append("直接 xattr：").append(p.optString("selinuxXattrContext", ""))
+                .append("（errno ").append(p.optInt("xattrErrno", -1)).append("）\n");
+        detail.append("直接 attr/current：").append(p.optString("selinuxAttrContext", ""))
+                .append("（errno ").append(p.optInt("selinuxAttrErrno", -1)).append("）\n");
         detail.append("CPU（单核口径）：").append(cpu(p.optDouble("cpuPercent", -1))).append('\n');
         detail.append("连续高负载命中：").append(p.optInt("consecutiveHigh")).append(" 次\n");
         appendCgroupEvidence(detail, p);
@@ -1091,10 +1178,7 @@ public final class MainActivity extends Activity {
     }
 
     private static boolean isRootCandidate(JSONObject process) {
-        return RootProcessFilter.accepts(process.optInt("uid", -1),
-                process.optBoolean("identityVerified"), process.optString("identityToken", ""),
-                process.optBoolean("avcRootDomainHint"), process.optString("avcTargetContext", ""),
-                process.optString("avcIdentityToken", ""));
+        return DomainEvidence.accepts(process);
     }
 
     private static boolean isVisibleProcess(JSONObject process, int collectorPid) {
@@ -1120,7 +1204,7 @@ public final class MainActivity extends Activity {
         String confirmation = getString(R.string.gpu_overlay_confirmed);
         int start = value.indexOf(confirmation);
         while (start >= 0) {
-            highlighted.setSpan(new ForegroundColorSpan(RED), start, start + confirmation.length(),
+            highlighted.setSpan(new ForegroundColorSpan(AMBER), start, start + confirmation.length(),
                     Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             start = value.indexOf(confirmation, start + confirmation.length());
         }

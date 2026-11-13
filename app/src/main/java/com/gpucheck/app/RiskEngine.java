@@ -50,7 +50,8 @@ final class RiskEngine {
         previousElapsed = elapsed;
         policy.beginSnapshot();
         JSONObject global = report.optJSONObject("globalGpu");
-        avcPolicy.beginSnapshot(global != null && global.optBoolean("sampled"), global != null && global.optBoolean("active"));
+        avcPolicy.beginSnapshot(global != null && global.optBoolean("sampled")
+                && global.optBoolean("activityKnown", true), global != null && global.optBoolean("active"));
         long sampleIndex = report.optLong("sampleIndex", -1);
         JSONObject cgroupScan = report.optJSONObject("cgroupScan");
         boolean cgroupPathMethodAvailable = cgroupScan != null
@@ -63,7 +64,7 @@ final class RiskEngine {
         JSONArray environmentChecks = report.optJSONArray("environmentChecks");
         if (environmentChecks == null) environmentChecks = new JSONArray();
         JSONArray excludedKernelThreads = new JSONArray();
-        int kernelDomainMismatches = 0;
+        int kernelDomainMismatches = 0, domainConflicts = 0;
         JSONArray nativeEvents = report.optJSONArray("processEvents");
         List<JSONObject> sorted = new ArrayList<>();
         int high = 0;
@@ -83,6 +84,8 @@ final class RiskEngine {
             int pid = p.optInt("pid", -1);
             boolean isSelf = isSelf(p, report);
             if (!MonitoredProcessFilter.acceptsCpu(pid, isSelf) || occurrences.get(pid) != 1) continue;
+            DomainEvidence.Result domain = DomainEvidence.apply(p, report.optLong("timestampEpochMs", -1), sampleIndex);
+            if ("CONFLICT".equals(domain.state)) domainConflicts++;
             String threadType = KernelThreadPolicy.classify(p, report);
             boolean kernelDomainMismatch = KernelThreadPolicy.kernelDomainMismatch(p, threadType);
             p.put("threadType", threadType).put("kernelDomainMismatch", kernelDomainMismatch);
@@ -129,8 +132,8 @@ final class RiskEngine {
             }
             if (cgroup.anomaly) cgroupAnomalies++;
             boolean explicitOtherDomain = observedUid < 0 && p.optBoolean("identityVerified")
-                    && !p.optBoolean("avcRootDomainHint") && !p.optString("avcTargetContext").isEmpty()
-                    && p.optString("identityToken").equals(p.optString("avcIdentityToken"));
+                    && (("VALID".equals(domain.state) && !domain.root) || "CONFLICT".equals(domain.state)
+                        || "MALFORMED".equals(domain.state));
             boolean watchedExit = processIdentity.equals(cgroupLifecycleWatches.get(pid))
                     && trustedExit(nativeEvents, pid, processIdentity, global);
             if ((observedUid > 0 || explicitOtherDomain) && !cgroup.validMissing && !watchedExit) {
@@ -138,6 +141,8 @@ final class RiskEngine {
             }
             p.remove("riskBasis");
             p.remove("riskConfidence");
+            p.remove("rootIdentityEvidence");
+            p.remove("gpuAttribution");
             String risk = "MONITORING", reason = sortableCpu(p) < 0
                     ? "正在建立 CPU 基线或当前 CPU 时钟不可读取。" : "正在持续采样该进程的 CPU 使用率。";
             int consecutive = 0;
@@ -152,16 +157,16 @@ final class RiskEngine {
                 if (identity.isEmpty() && p.optLong("startTimeTicks") > 0) identity = "stat:" + p.optLong("startTimeTicks");
                 if (p.has("identityVerified") && !p.optBoolean("identityVerified")) identity = "";
                 AvcRiskPolicy.Decision avc = avcPolicy.evaluate(pid, identity,
-                        p.optDouble("cpuPercent", -1), p.optBoolean("avcRootDomainHint"), false);
+                        p.optDouble("cpuPercent", -1), domain.root, false);
                 risk = d.risk; reason = d.reason; consecutive = d.consecutiveHigh;
-                if (!"HIGH".equals(risk) && p.optBoolean("avcRootDomainHint")) {
+                if (!"HIGH".equals(risk) && domain.root) {
                     risk = avc.risk; reason = avc.reason; consecutive = avc.consecutiveHigh;
                 }
                 if ("HIGH".equals(avc.risk)) {
                     risk = "HIGH"; reason = avc.reason; consecutive = avc.consecutiveHigh;
-                    p.put("riskBasis", "avc_root_domain_cpu_global_memstore")
+                    p.put("riskBasis", "avc".equals(domain.source) ? "avc_root_domain_cpu_global_memstore" : "selinux_root_domain_cpu_global_memstore")
                             .put("riskConfidence", "heuristic").put("gpuAttribution", "global_unattributed")
-                            .put("rootIdentityEvidence", "avc_target_selinux_domain");
+                            .put("rootIdentityEvidence", domain.source);
                 } else if ("HIGH".equals(d.risk)) {
                     p.put("riskBasis", "verified_uid_background_gpu_device_cpu").put("riskConfidence", "direct_metadata");
                 }
@@ -169,6 +174,11 @@ final class RiskEngine {
             if (cgroup.anomaly && !"HIGH".equals(risk)) {
                 risk = "WATCH"; reason = cgroup.reason;
                 p.put("riskBasis", "proc_cgroup_path_mismatch").put("riskConfidence", "named_path_mismatch");
+            }
+            if ("CONFLICT".equals(domain.state)) {
+                reason = "SELinux 来源不一致，已暂停域身份推断，需重新采样；可能存在执行域变化。" + reason;
+            } else if ("MALFORMED".equals(domain.state)) {
+                reason = "SELinux 标签格式无效，未用于身份判断。" + reason;
             }
             p.put("risk", risk).put("consecutiveHigh", consecutive).put("reason", reason);
             sorted.add(p);
@@ -310,6 +320,7 @@ final class RiskEngine {
                 .put("kernelThreadExcludedCount", excludedKernelThreads.length())
                 .put("excludedKernelThreads", excludedKernelThreads)
                 .put("kernelDomainMismatchCount", kernelDomainMismatches)
+                .put("domainEvidenceConflictCount", domainConflicts)
                 .put("environmentChecks", environmentChecks)
                 .put("environmentAnomaly", report.optBoolean("environmentAnomaly") || kernelDomainMismatches > 0)
                 .put("rootProcessCount", rootCount).put("rootWatchCount", watching)
@@ -339,9 +350,7 @@ final class RiskEngine {
     }
 
     private static boolean isRoot(JSONObject p) {
-        return RootProcessFilter.accepts(p.optInt("uid", -1), p.optBoolean("identityVerified"),
-                p.optString("identityToken", ""), p.optBoolean("avcRootDomainHint"),
-                p.optString("avcTargetContext", ""), p.optString("avcIdentityToken", ""));
+        return DomainEvidence.accepts(p);
     }
 
     private static boolean isSelf(JSONObject p, JSONObject report) {
