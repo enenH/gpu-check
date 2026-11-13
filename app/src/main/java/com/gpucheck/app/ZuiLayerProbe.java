@@ -101,7 +101,11 @@ final class ZuiLayerProbe {
                 List<LayerTextParser.Row> rows = LayerTextParser.surfaceDump(new String(bytes, StandardCharsets.UTF_8));
                 JSONObject evidence = new JSONObject().put("source", directory.toPath().relativize(file.toPath()).toString())
                         .put("bytes", bytes.length).put("sha256", sha256(bytes));
-                for (LayerTextParser.Row row : rows) unique.put(row.name, LayerProbe.row(row.name, "zui", evidence, row.pid, row.uid));
+                for (LayerTextParser.Row row : rows) {
+                    JSONObject item = LayerProbe.row(row.name, "zui", evidence, row.pid, row.uid);
+                    if (row.ownerConflict) item.put("ownershipSource", "conflicting_duplicate_name");
+                    unique.put(row.name, item);
+                }
             }
             result.put("rows", new JSONArray(unique.values())).put("available", !unique.isEmpty())
                     .put("status", unique.isEmpty() ? "NO_DATA" : "AVAILABLE");

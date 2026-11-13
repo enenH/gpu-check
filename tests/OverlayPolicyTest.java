@@ -75,6 +75,29 @@ public final class OverlayPolicyTest {
         check(parsed.get(1).pid == 2770, "ZUI distinct owner");
         check(LayerTextParser.surfaceDump("Permission Denial: SurfaceFlinger").isEmpty(), "ZUI permission text is not a layer");
         check(LayerTextParser.surfaceDump("  Layer [55] random#55\n └─ other#55 pid=99 uid=0").get(0).pid == -1, "Never join by layer number alone");
+        // Two layers sharing one exact full name cannot both claim a different owner.
+        // Keeping the last line would fabricate a single owner and could hide a uid 0 layer.
+        String conflicting = "  Layer [174] [BBQ] dup#173#174\n"
+                + " └─ [BBQ] dup#173#174 pid=10190 uid=0\n"
+                + "  Layer [180] [BBQ] dup#173#174\n"
+                + " └─ [BBQ] dup#173#174 pid=2770 uid=1000\n";
+        List<LayerTextParser.Row> dupRows = LayerTextParser.surfaceDump(conflicting);
+        check(dupRows.size() == 1, "Duplicate full names keep one row");
+        check(dupRows.get(0).pid == -1 && dupRows.get(0).uid == -1, "Conflicting owners stay unknown");
+        check(dupRows.get(0).ownerConflict, "Conflicting owners are reported as a conflict");
+        String agreeing = "  Layer [174] [BBQ] dup#173#174\n"
+                + " └─ [BBQ] dup#173#174 pid=10190 uid=0\n"
+                + " └─ [BBQ] dup#173#174 pid=10190 uid=0\n";
+        List<LayerTextParser.Row> sameRows = LayerTextParser.surfaceDump(agreeing);
+        check(sameRows.get(0).pid == 10190 && sameRows.get(0).uid == 0, "Repeated agreeing owner is retained");
+        check(!sameRows.get(0).ownerConflict, "Repeated agreeing owner is not a conflict");
+        String malformed = "  Layer [174] [BBQ] dup#173#174\n"
+                + " └─ [BBQ] dup#173#174 pid=999999999999 uid=0\n"
+                + " └─ [BBQ] dup#173#174 pid=2770 uid=1000\n";
+        List<LayerTextParser.Row> malformedRows = LayerTextParser.surfaceDump(malformed);
+        check(malformedRows.get(0).pid == 2770 && malformedRows.get(0).uid == 1000,
+                "An unparseable owner line does not destroy a valid owner claim");
+        check(!malformedRows.get(0).ownerConflict, "An unparseable owner line is not a conflict");
         if (args.length == 1) {
             for (String name : java.nio.file.Files.readAllLines(java.nio.file.Path.of(args[0]))) {
                 LayerNamePolicy.Decision decision = LayerNamePolicy.classify(name);
