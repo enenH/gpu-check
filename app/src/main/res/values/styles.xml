@@ -9,6 +9,8 @@
         <item name="android:navigationBarColor">@color/app_background</item>
         <item name="android:colorAccent">@color/app_accent</item>
         <item name="android:textColorPrimary">@color/app_text</item>
+        <item name="android:textColorSecondary">@color/app_text_secondary</item>
+        <item name="android:colorControlHighlight">#2380D8EB</item>
         <item name="android:windowSoftInputMode">adjustResize</item>
     </style>
     <style name="AppTheme" parent="BaseAppTheme" />

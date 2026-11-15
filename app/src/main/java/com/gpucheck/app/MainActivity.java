@@ -1,11 +1,12 @@
 package com.gpucheck.app;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -13,12 +14,15 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.text.SpannableString;
 import android.text.Spanned;
+import android.text.TextUtils;
 import android.text.style.ForegroundColorSpan;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -38,14 +42,30 @@ import java.util.Objects;
 /** A local-only dashboard. Every risk label comes from the monitor's measured report. */
 public final class MainActivity extends Activity {
     static final int MAX_DISPLAYED_PROCESSES = 10;
-    private static final int BG = Color.rgb(10, 20, 25);
-    private static final int SURFACE = Color.rgb(18, 35, 43);
-    private static final int BORDER = Color.rgb(38, 65, 74);
-    private static final int TEXT = Color.rgb(238, 248, 245);
-    private static final int MUTED = Color.rgb(150, 174, 180);
-    private static final int ACCENT = Color.rgb(98, 227, 187);
+    private static final int BG = Color.rgb(8, 12, 19);
+    private static final int SURFACE = Color.rgb(16, 25, 36);
+    private static final int BORDER = Color.rgb(38, 50, 66);
+    private static final int TEXT = Color.rgb(243, 245, 247);
+    private static final int MUTED = Color.rgb(155, 169, 187);
+    private static final int ACCENT = Color.rgb(214, 245, 139);
+    private static final int CYAN = Color.rgb(128, 216, 235);
     private static final int RED = Color.rgb(255, 119, 125);
-    private static final int AMBER = Color.rgb(255, 202, 121);
+    private static final int AMBER = Color.rgb(246, 200, 121);
+
+    private final LinearLayout[] pages = new LinearLayout[3];
+    private final Button[] pageTabs = new Button[3];
+    private final int[] pageScrollPositions = new int[3];
+    private ScrollView workspaceScroll;
+    private TextView pageTitle;
+    private TextView pageSubtitle;
+    private TextView sessionCaption;
+    private TextView alertRibbon;
+    private TextView overviewGpuStatus;
+    private TextView overviewOverlayStatus;
+    private TextView evidenceSessionStatus;
+    private SignalRadarView signalRadar;
+    private int selectedPage;
+    private int controlAppearance = -1;
 
     private TextView stateBadge;
     private TextView riskCount;
@@ -100,8 +120,20 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         MonitorService.clearPreviousResults(this);
+        if (state != null) {
+            selectedPage = Math.max(0, Math.min(2, state.getInt("selectedPage", 0)));
+            int[] positions = state.getIntArray("pageScrollPositions");
+            if (positions != null && positions.length == 3) System.arraycopy(positions, 0, pageScrollPositions, 0, 3);
+        }
         buildUi();
         renderLatest();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        pageScrollPositions[selectedPage] = workspaceScroll.getScrollY();
+        state.putInt("selectedPage", selectedPage);
+        state.putIntArray("pageScrollPositions", pageScrollPositions);
+        super.onSaveInstanceState(state);
     }
 
     @Override protected void onResume() {
@@ -136,8 +168,10 @@ public final class MainActivity extends Activity {
     }
 
     private void buildUi() {
-        LinearLayout frame = new LinearLayout(this);
-        frame.setOrientation(LinearLayout.VERTICAL);
+        boolean compactChrome = getResources().getConfiguration().screenHeightDp < 480
+                || getResources().getConfiguration().fontScale >= 1.6f;
+        LinearLayout frame = vertical();
+        frame.setGravity(Gravity.CENTER_HORIZONTAL);
         frame.setBackgroundColor(BG);
         frame.setOnApplyWindowInsetsListener((v, insets) -> {
             if (Build.VERSION.SDK_INT >= 30) {
@@ -149,135 +183,325 @@ public final class MainActivity extends Activity {
             }
             return insets;
         });
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setClipToPadding(false);
-        LinearLayout page = vertical();
-        page.setPadding(dp(20), dp(18), dp(20), dp(30));
-        scroll.addView(page, new ScrollView.LayoutParams(-1, -2));
-        frame.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        LinearLayout workspace = vertical();
+        int width = getResources().getConfiguration().screenWidthDp >= 800 ? dp(760) : -1;
+        frame.addView(workspace, new LinearLayout.LayoutParams(width, -1));
         setContentView(frame);
 
         LinearLayout heading = row();
-        TextView brand = label("GPU CHECK", 12, ACCENT, true);
-        brand.setLetterSpacing(0.15f);
-        heading.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
-        stateBadge = badge("未运行", MUTED);
+        heading.setPadding(dp(20), dp(14), dp(20), dp(14));
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.ic_observatory);
+        logo.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        heading.addView(logo, new LinearLayout.LayoutParams(dp(36), dp(36)));
+        LinearLayout brand = vertical();
+        TextView wordmark = label("GPU CHECK", 17, TEXT, true);
+        wordmark.setLetterSpacing(0.08f);
+        brand.addView(wordmark);
+        marginAdd(brand, mono("SIGNAL OBSERVATORY", 9, MUTED), 3);
+        LinearLayout.LayoutParams brandParams = new LinearLayout.LayoutParams(0, -2, 1);
+        brandParams.leftMargin = dp(10);
+        heading.addView(brand, brandParams);
+        stateBadge = badge("待机", MUTED);
         heading.addView(stateBadge);
-        page.addView(heading);
-        TextView title = label("全进程 CPU 监听", 27, TEXT, true);
-        marginAdd(page, title, 12);
-        TextView subtitle = label("排除自身进程与线程 · 显示 CPU 前 10", 13, MUTED, false);
-        marginAdd(page, subtitle, 6);
+        if (compactChrome) heading.setVisibility(View.GONE);
+        workspace.addView(heading);
 
-        overlayCard = card();
-        overlayStatus = label("悬浮窗检测 · 等待开始", 18, MUTED, true);
-        overlayNames = label("", 12, TEXT, false);
-        overlayNames.setLineSpacing(dp(3), 1f);
-        overlayNames.setVisibility(View.GONE);
-        overlayCard.addView(overlayStatus);
-        marginAdd(overlayCard, overlayNames, 6);
-        overlayCard.setOnClickListener(v -> showOverlayEvidence());
-        overlayCard.setFocusable(true);
-        marginAdd(page, overlayCard, 16);
+        LinearLayout navigation = row();
+        navigation.setPadding(dp(4), dp(4), dp(4), dp(4));
+        navigation.setBackground(shape(SURFACE, BORDER, 16));
+        String[] tabs = {"01  总览", "02  进程", "03  证据"};
+        for (int i = 0; i < tabs.length; i++) {
+            final int index = i;
+            Button tab = button(tabs[i], false);
+            tab.setTextSize(12);
+            tab.setMinHeight(dp(44));
+            tab.setPadding(dp(4), dp(8), dp(4), dp(8));
+            tab.setOnClickListener(v -> selectPage(index));
+            pageTabs[i] = tab;
+            navigation.addView(tab, new LinearLayout.LayoutParams(0, -2, 1));
+        }
+        LinearLayout.LayoutParams navigationParams = new LinearLayout.LayoutParams(-1, -2);
+        navigationParams.setMargins(dp(20), compactChrome ? dp(8) : 0, dp(20), dp(2));
+        workspace.addView(navigation, navigationParams);
 
-        gpuFrequencyWarning = label("", 18, RED, true);
+        alertRibbon = label("", 12, RED, true);
+        alertRibbon.setPadding(dp(16), dp(12), dp(16), dp(12));
+        alertRibbon.setMinHeight(dp(48));
+        alertRibbon.setBackground(shape(Color.rgb(42, 24, 32), Color.rgb(94, 48, 59), 12));
+        alertRibbon.setVisibility(View.GONE);
+        alertRibbon.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        alertRibbon.setOnClickListener(v -> openPriorityEvidence());
+        alertRibbon.setFocusable(true);
+        LinearLayout.LayoutParams alertParams = new LinearLayout.LayoutParams(-1, -2);
+        alertParams.setMargins(dp(20), dp(8), dp(20), 0);
+        if (!compactChrome) workspace.addView(alertRibbon, alertParams);
+
+        workspaceScroll = new ScrollView(this);
+        workspaceScroll.setFillViewport(true);
+        workspaceScroll.setClipToPadding(false);
+        workspaceScroll.setVerticalScrollBarEnabled(false);
+        LinearLayout page = vertical();
+        page.setPadding(dp(20), dp(24), dp(20), dp(28));
+        workspaceScroll.addView(page, new ScrollView.LayoutParams(-1, -2));
+        workspace.addView(workspaceScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        if (compactChrome) {
+            LinearLayout.LayoutParams scrollAlertParams = new LinearLayout.LayoutParams(-1, -2);
+            scrollAlertParams.bottomMargin = dp(18);
+            page.addView(alertRibbon, scrollAlertParams);
+        }
+        TextView device = mono((compactChrome ? "GPU CHECK  /  ANDROID " : "ON DEVICE  /  ANDROID ")
+                + Build.VERSION.RELEASE, 10, CYAN);
+        device.setLetterSpacing(0.1f);
+        page.addView(device);
+        pageTitle = label("信号总览", 30, TEXT, true);
+        if (Build.VERSION.SDK_INT >= 28) pageTitle.setAccessibilityHeading(true);
+        marginAdd(page, pageTitle, 7);
+        pageSubtitle = label("从进程到图层，让异常信号浮出水面。", 12, MUTED, false);
+        pageSubtitle.setLineSpacing(dp(3), 1f);
+        marginAdd(page, pageSubtitle, 6);
+        for (int i = 0; i < pages.length; i++) {
+            pages[i] = vertical();
+            marginAdd(page, pages[i], 22);
+        }
+        buildOverview(pages[0]);
+        buildProcesses(pages[1]);
+        buildEvidence(pages[2]);
+
+        View divider = new View(this);
+        divider.setBackgroundColor(BORDER);
+        workspace.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
+        LinearLayout controls = vertical();
+        controls.setPadding(dp(20), dp(10), dp(20), dp(10));
+        controls.setBackgroundColor(BG);
+        sessionCaption = mono("SESSION / 等待开始", 10, MUTED);
+        sessionCaption.setGravity(Gravity.CENTER);
+        if (compactChrome) sessionCaption.setVisibility(View.GONE);
+        controls.addView(sessionCaption, new LinearLayout.LayoutParams(-1, -2));
+        startButton = button("开始检测", true);
+        startButton.setTextSize(16);
+        startButton.setMinHeight(dp(52));
+        startButton.setPadding(dp(20), dp(12), dp(20), dp(12));
+        startButton.setOnClickListener(v -> toggleMonitor());
+        marginAdd(controls, startButton, compactChrome ? 0 : 8);
+        TextView local = label("界面可见时采样  ·  停止即清空", 10, MUTED, false);
+        local.setGravity(Gravity.CENTER);
+        if (compactChrome) local.setVisibility(View.GONE);
+        marginAdd(controls, local, 7);
+        workspace.addView(controls);
+        applyPageSelection();
+        workspaceScroll.post(() -> workspaceScroll.scrollTo(0, pageScrollPositions[selectedPage]));
+    }
+
+    private void buildOverview(LinearLayout page) {
+        hero = card();
+        hero.setPadding(dp(20), dp(20), dp(20), dp(20));
+        hero.setBackground(heroBackground(BORDER));
+        TextView eyebrow = mono("LIVE SIGNAL / 实时风险", 10, ACCENT);
+        eyebrow.setLetterSpacing(0.12f);
+        hero.addView(eyebrow);
+        LinearLayout summary = row();
+        LinearLayout number = vertical();
+        riskCount = mono("—", 68, TEXT);
+        riskCount.setIncludeFontPadding(false);
+        riskCount.setMaxLines(1);
+        riskCount.setAutoSizeTextTypeUniformWithConfiguration(22, 68, 1, TypedValue.COMPLEX_UNIT_SP);
+        number.addView(riskCount, new LinearLayout.LayoutParams(-1, dp(86)));
+        marginAdd(number, label("高风险进程", 12, MUTED, false), 4);
+        summary.addView(number, new LinearLayout.LayoutParams(0, -2, 1));
+        signalRadar = new SignalRadarView(this);
+        if (getResources().getConfiguration().screenWidthDp < 350
+                || getResources().getConfiguration().fontScale > 1.4f) {
+            signalRadar.setVisibility(View.GONE);
+        }
+        summary.addView(signalRadar, new LinearLayout.LayoutParams(dp(116), dp(116)));
+        marginAdd(hero, summary, 16);
+        heroStatus = label("等待开始检测", 18, TEXT, true);
+        marginAdd(hero, heroStatus, 16);
+        heroDescription = label("检测界面可见期间采样，无需任何授权。", 12, MUTED, false);
+        heroDescription.setLineSpacing(dp(3), 1f);
+        marginAdd(hero, heroDescription, 8);
+        View rule = new View(this);
+        rule.setBackgroundColor(BORDER);
+        LinearLayout.LayoutParams ruleParams = new LinearLayout.LayoutParams(-1, dp(1));
+        ruleParams.topMargin = dp(18);
+        ruleParams.bottomMargin = dp(12);
+        hero.addView(rule, ruleParams);
+        watchSummary = label(getString(R.string.monitoring_summary, 0, 0, 0), 11, MUTED, false);
+        watchSummary.setLineSpacing(dp(2), 1f);
+        hero.addView(watchSummary);
+        page.addView(hero);
+
+        boolean stackMetrics = getResources().getConfiguration().fontScale > 1.25f
+                || getResources().getConfiguration().screenWidthDp < 340;
+        LinearLayout metrics = stackMetrics ? vertical() : row();
+        metrics.setGravity(Gravity.TOP);
+        candidateMetric = metric(metrics, getString(R.string.monitored_processes_metric), "PROC", ACCENT);
+        gpuMetric = metric(metrics, "按进程 GPU 证据", "GPU", CYAN);
+        cpuMetric = metric(metrics, "最高 CPU", "CPU", TEXT);
+        marginAdd(page, metrics, 12);
+
+        marginAdd(page, sectionHeading("检测通道", "SIGNAL CHANNELS"), 26);
+        gpuFrequencyWarning = label("", 16, RED, true);
         gpuFrequencyWarning.setLineSpacing(dp(3), 1f);
-        gpuFrequencyWarning.setPadding(dp(18), dp(14), dp(18), dp(14));
-        gpuFrequencyWarning.setBackground(shape(Color.rgb(43, 30, 35), RED, 16));
+        gpuFrequencyWarning.setPadding(dp(18), dp(18), dp(18), dp(18));
+        gpuFrequencyWarning.setBackground(shape(Color.rgb(42, 24, 32), RED, 18));
         gpuFrequencyWarning.setVisibility(View.GONE);
         gpuFrequencyWarning.setOnClickListener(v -> showGpuFrequencyEvidence());
         gpuFrequencyWarning.setFocusable(true);
         marginAdd(page, gpuFrequencyWarning, 12);
 
-        hero = card();
-        marginAdd(page, hero, 22);
-        TextView eyebrow = label("当前高风险", 13, MUTED, false);
-        hero.addView(eyebrow);
-        LinearLayout summary = row();
-        summary.setGravity(Gravity.CENTER_VERTICAL);
-        riskCount = label("—", 54, TEXT, true);
-        summary.addView(riskCount, new LinearLayout.LayoutParams(-2, -2));
-        heroStatus = label("等待开始检测", 17, TEXT, true);
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(0, -2, 1);
-        statusParams.leftMargin = dp(18);
-        summary.addView(heroStatus, statusParams);
-        marginAdd(hero, summary, 3);
-        heroDescription = label("检测界面可见期间采样，无需任何授权。", 13, MUTED, false);
-        heroDescription.setLineSpacing(dp(3), 1f);
-        marginAdd(hero, heroDescription, 3);
-        watchSummary = label(getString(R.string.monitoring_summary, 0, 0, 0), 13, AMBER, true);
-        marginAdd(hero, watchSummary, 10);
-        permissionStatus = label("无需任何授权", 11, MUTED, false);
-        marginAdd(hero, permissionStatus, 8);
-        globalGpuStatus = label(getString(R.string.global_gpu_waiting), 11, MUTED, false);
-        globalGpuStatus.setLineSpacing(dp(2), 1f);
-        globalGpuStatus.setOnClickListener(v -> showGlobalGpuEvidence());
-        marginAdd(hero, globalGpuStatus, 4);
-        View line = new View(this);
-        line.setBackgroundColor(BORDER);
-        LinearLayout.LayoutParams divider = new LinearLayout.LayoutParams(-1, dp(1));
-        divider.topMargin = dp(18);
-        divider.bottomMargin = dp(16);
-        hero.addView(line, divider);
-        LinearLayout metrics = row();
-        candidateMetric = metric(metrics, getString(R.string.monitored_processes_metric));
-        gpuMetric = metric(metrics, "按进程 GPU 证据");
-        cpuMetric = metric(metrics, "最高 CPU");
-        hero.addView(metrics);
-        sampleStatus = label("采样尚未启动", 11, MUTED, false);
-        marginAdd(hero, sampleStatus, 15);
-
-        recentLifecycleSignals = label("", 12, AMBER, false);
-        recentLifecycleSignals.setLineSpacing(dp(3), 1f);
-        recentLifecycleSignals.setVisibility(View.GONE);
-        marginAdd(page, recentLifecycleSignals, 10);
-
         environmentCard = card();
-        environmentCard.setBackground(shape(Color.rgb(43, 30, 35), RED, 16));
-        environmentCard.addView(label(getString(R.string.environment_anomaly), 17, RED, true));
-        environmentSummary = label("", 13, TEXT, false);
+        environmentCard.setBackground(shape(Color.rgb(42, 24, 32), Color.rgb(94, 48, 59), 18));
+        environmentCard.addView(mono("ALERT / 环境一致性", 10, RED));
+        marginAdd(environmentCard, label(getString(R.string.environment_anomaly), 17, RED, true), 10);
+        environmentSummary = label("", 12, TEXT, false);
         environmentSummary.setLineSpacing(dp(3), 1f);
         marginAdd(environmentCard, environmentSummary, 8);
-        marginAdd(environmentCard, label(getString(R.string.environment_conflict_details), 11, MUTED, false), 8);
+        marginAdd(environmentCard, label(getString(R.string.environment_conflict_details) + "  ↗", 11, RED, true), 12);
         environmentCard.setOnClickListener(v -> showEnvironmentEvidence());
         environmentCard.setFocusable(true);
         environmentCard.setVisibility(View.GONE);
-        marginAdd(page, environmentCard, 14);
+        marginAdd(page, environmentCard, 12);
 
-        startButton = button("开始检测", true);
-        startButton.setOnClickListener(v -> toggleMonitor());
-        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, dp(48));
-        startParams.topMargin = dp(14);
-        page.addView(startButton, startParams);
-        errorText = label("", 12, AMBER, false);
-        errorText.setLineSpacing(dp(3), 1f);
-        errorText.setVisibility(View.GONE);
-        marginAdd(page, errorText, 12);
+        overlayCard = card();
+        overlayCard.addView(channelHeading("01", "图层侦测", "LAYERS"));
+        overlayStatus = label("悬浮窗检测 · 等待开始", 15, MUTED, true);
+        marginAdd(overlayCard, overlayStatus, 14);
+        overlayNames = label("", 12, TEXT, false);
+        overlayNames.setLineSpacing(dp(3), 1f);
+        overlayNames.setVisibility(View.GONE);
+        marginAdd(overlayCard, overlayNames, 8);
+        marginAdd(overlayCard, label("名称线索与探测路线  ↗", 11, CYAN, true), 14);
+        overlayCard.setOnClickListener(v -> showOverlayEvidence());
+        overlayCard.setFocusable(true);
+        marginAdd(page, overlayCard, 12);
 
-        LinearLayout execCard = card();
-        gpuExecStatus = label("GPU 多槽采样 · 等待开始", 16, TEXT, true);
-        gpuExecRows = label("", 12, MUTED, false);
-        gpuExecRows.setLineSpacing(dp(3), 1f);
-        execCard.addView(gpuExecStatus);
-        marginAdd(execCard, gpuExecRows, 6);
-        marginAdd(execCard, label("整机槽位观察 · 归属未知 · 点击查看详情", 11, MUTED, false), 6);
-        execCard.setOnClickListener(v -> showGpuExecEvidence());
-        execCard.setFocusable(true);
-        marginAdd(page, execCard, 14);
+        LinearLayout globalPreview = card();
+        globalPreview.addView(channelHeading("02", "GPU 活动", "GLOBAL"));
+        overviewGpuStatus = label(getString(R.string.global_gpu_waiting), 13, MUTED, false);
+        overviewGpuStatus.setLineSpacing(dp(3), 1f);
+        marginAdd(globalPreview, overviewGpuStatus, 14);
+        marginAdd(globalPreview, label("查看整机采样依据  ↗", 11, CYAN, true), 14);
+        globalPreview.setOnClickListener(v -> showGlobalGpuEvidence());
+        globalPreview.setFocusable(true);
+        marginAdd(page, globalPreview, 12);
 
-        LinearLayout sectionHeading = row();
+        recentLifecycleSignals = label("", 12, AMBER, false);
+        recentLifecycleSignals.setLineSpacing(dp(4), 1f);
+        recentLifecycleSignals.setPadding(dp(16), dp(14), dp(16), dp(14));
+        recentLifecycleSignals.setBackground(shape(SURFACE, BORDER, 14));
+        recentLifecycleSignals.setVisibility(View.GONE);
+        marginAdd(page, recentLifecycleSignals, 12);
+
+        Button processes = button("进入进程排行  ↗", false);
+        processes.setOnClickListener(v -> selectPage(1));
+        marginAdd(page, processes, 20);
+    }
+
+    private void buildProcesses(LinearLayout page) {
+        LinearLayout intro = card();
+        intro.addView(mono("CPU / LIVE RANKING", 10, CYAN));
         listTitle = label(getString(R.string.candidates_title), 18, TEXT, true);
-        sectionHeading.addView(listTitle, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView detailHint = label("点击查看证据", 11, MUTED, false);
-        sectionHeading.addView(detailHint);
-        marginAdd(page, sectionHeading, 24);
+        marginAdd(intro, listTitle, 10);
+        TextView note = label("按 CPU 实时排序 · 点击进程查看完整证据\n单核口径，负载可超过 100%；未知值保留为 —。", 12, MUTED, false);
+        note.setLineSpacing(dp(3), 1f);
+        marginAdd(intro, note, 8);
+        page.addView(intro);
         processList = vertical();
-        marginAdd(page, processList, 6);
+        marginAdd(page, processList, 4);
+        TextView scope = label("排除自身进程与线程、已确认的内核线程。\n前 10 名之外的进程仍持续采样。", 11, MUTED, false);
+        scope.setLineSpacing(dp(3), 1f);
+        marginAdd(page, scope, 18);
+    }
 
-        TextView local = label("实时检测  /  停止清空  /  无需任何授权", 10, MUTED, false);
-        local.setGravity(Gravity.CENTER);
-        marginAdd(page, local, 20);
+    private void buildEvidence(LinearLayout page) {
+        LinearLayout session = card();
+        session.addView(mono("SESSION / 本次采样", 10, ACCENT));
+        evidenceSessionStatus = label("等待开始检测", 18, TEXT, true);
+        marginAdd(session, evidenceSessionStatus, 10);
+        permissionStatus = label("无需任何授权", 12, MUTED, false);
+        marginAdd(session, permissionStatus, 10);
+        sampleStatus = label("采样尚未启动", 12, MUTED, false);
+        sampleStatus.setLineSpacing(dp(4), 1f);
+        marginAdd(session, sampleStatus, 8);
+        errorText = label("", 12, AMBER, false);
+        errorText.setLineSpacing(dp(4), 1f);
+        errorText.setVisibility(View.GONE);
+        marginAdd(session, errorText, 12);
+        page.addView(session);
+
+        LinearLayout global = card();
+        global.addView(channelHeading("01", "全局 GPU", "MEMSTORE"));
+        globalGpuStatus = label(getString(R.string.global_gpu_waiting), 14, MUTED, false);
+        globalGpuStatus.setLineSpacing(dp(3), 1f);
+        marginAdd(global, globalGpuStatus, 14);
+        marginAdd(global, label("整机计数 · 未归属任何 PID  ↗", 11, CYAN, true), 14);
+        global.setOnClickListener(v -> showGlobalGpuEvidence());
+        global.setFocusable(true);
+        marginAdd(page, global, 12);
+
+        LinearLayout exec = card();
+        exec.addView(channelHeading("02", "多槽观察", "MULTI SLOT"));
+        gpuExecStatus = label("GPU 多槽采样 · 等待开始", 14, TEXT, true);
+        marginAdd(exec, gpuExecStatus, 14);
+        gpuExecRows = label("", 12, MUTED, false);
+        gpuExecRows.setLineSpacing(dp(5), 1f);
+        marginAdd(exec, gpuExecRows, 8);
+        marginAdd(exec, label("观察等待间隔 · 查看全部槽位  ↗", 11, CYAN, true), 14);
+        exec.setOnClickListener(v -> showGpuExecEvidence());
+        exec.setFocusable(true);
+        marginAdd(page, exec, 12);
+
+        LinearLayout layers = card();
+        layers.addView(channelHeading("03", "图层名称", "LAYER PROBE"));
+        overviewOverlayStatus = label("悬浮窗检测 · 等待开始", 14, MUTED, false);
+        overviewOverlayStatus.setLineSpacing(dp(3), 1f);
+        marginAdd(layers, overviewOverlayStatus, 14);
+        marginAdd(layers, label("查看探测范围与名称依据  ↗", 11, CYAN, true), 14);
+        layers.setOnClickListener(v -> showOverlayEvidence());
+        layers.setFocusable(true);
+        marginAdd(page, layers, 12);
+
+        TextView footnote = label("这里呈现本次检测的原始依据与读取限制。\n停止或离开界面后，本次结果会清空。", 11, MUTED, false);
+        footnote.setLineSpacing(dp(3), 1f);
+        marginAdd(page, footnote, 20);
+    }
+
+    private void selectPage(int index) {
+        if (index < 0 || index >= pages.length || index == selectedPage) return;
+        pageScrollPositions[selectedPage] = workspaceScroll.getScrollY();
+        selectedPage = index;
+        applyPageSelection();
+        workspaceScroll.post(() -> workspaceScroll.scrollTo(0, pageScrollPositions[selectedPage]));
+    }
+
+    private void applyPageSelection() {
+        String[] titles = {"信号总览", "进程脉搏", "证据透视"};
+        String[] descriptions = {"从进程到图层，让异常信号浮出水面。",
+                "追踪每一份负载，读懂正在发生的活动。", "每一个判断，都能回到采样依据。"};
+        pageTitle.setText(titles[selectedPage]);
+        pageSubtitle.setText(descriptions[selectedPage]);
+        for (int i = 0; i < pages.length; i++) {
+            boolean selected = i == selectedPage;
+            pages[i].setVisibility(selected ? View.VISIBLE : View.GONE);
+            pageTabs[i].setSelected(selected);
+            pageTabs[i].setTextColor(selected ? BG : MUTED);
+            pageTabs[i].setBackground(ripple(selected ? ACCENT : Color.TRANSPARENT,
+                    selected ? ACCENT : Color.TRANSPARENT, 12));
+            pageTabs[i].setContentDescription(new String[]{"总览", "进程", "证据"}[i]
+                    + (selected ? "，已选择" : "，切换页面"));
+        }
+    }
+
+    private void openPriorityEvidence() {
+        JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
+        if (overlay != null && overlay.optBoolean("suspected")) showOverlayEvidence();
+        else if (currentReport != null && currentReport.optBoolean("environmentAnomaly")) showEnvironmentEvidence();
+        else if (gpuFrequencyWarning.getVisibility() == View.VISIBLE) showGpuFrequencyEvidence();
+        else if (currentReport != null && !isStartingReport() && riskCount.getCurrentTextColor() == RED) selectPage(1);
+        else selectPage(errorText.getVisibility() == View.VISIBLE ? 2 : 1);
     }
 
     private void toggleMonitor() {
@@ -304,6 +528,11 @@ public final class MainActivity extends Activity {
     }
 
     private void renderLatest() {
+        renderReport();
+        updateDashboardChrome();
+    }
+
+    private void renderReport() {
         boolean running = MonitorService.running;
         if (running) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -320,9 +549,9 @@ public final class MainActivity extends Activity {
         lastRenderedError = currentError;
         heroDescription.setVisibility(View.VISIBLE);
         startButton.setText(running ? "停止检测" : "开始检测");
-        stateBadge.setText(running ? "●  监测中" : "●  已停止");
+        stateBadge.setText(running ? "●  监测中" : "○  待机");
         stateBadge.setTextColor(running ? ACCENT : MUTED);
-        stateBadge.setBackground(shape(running ? Color.rgb(20, 58, 49) : SURFACE, BORDER, 18));
+        stateBadge.setBackground(shape(running ? Color.rgb(35, 48, 35) : SURFACE, BORDER, 18));
         if (raw == null || raw.isEmpty()) {
             currentReport = null;
             renderedReport = null;
@@ -338,7 +567,7 @@ public final class MainActivity extends Activity {
             sampleStatus.setText(R.string.no_retained_results);
             permissionStatus.setText(getString(R.string.ordinary_mode, uidText(android.os.Process.myUid())));
             updateGlobalGpuStatus();
-            hero.setBackground(shape(SURFACE, BORDER, 18));
+            hero.setBackground(heroBackground(BORDER));
             riskCount.setText("—");
             riskCount.setTextColor(TEXT);
             String error = currentError;
@@ -361,7 +590,7 @@ public final class MainActivity extends Activity {
                 permissionStatus.setText(getString(R.string.ordinary_mode, uidText(currentReport.optInt("collectorUid", -1))));
                 riskCount.setText("—");
                 riskCount.setTextColor(TEXT);
-                hero.setBackground(shape(SURFACE, BORDER, 18));
+                hero.setBackground(heroBackground(BORDER));
                 heroStatus.setText("正在建立采样基线");
                 heroDescription.setText(R.string.collector_starting);
                 candidateMetric.setText("—");
@@ -390,12 +619,14 @@ public final class MainActivity extends Activity {
             if (processes != null) {
                 for (int i = 0; i < processes.length(); i++) {
                     JSONObject p = processes.optJSONObject(i);
-                    if (p == null || !isVisibleProcess(p, currentReport.optInt("collectorPid", -1))) continue;
+                    if (p == null || !isVisibleProcess(p, currentReport.optInt("collectorPid", -1))) {
+                        continue;
+                    }
                     monitoredCount++;
                     boolean rootCandidate = isRootCandidate(p);
-                    if (rootCandidate) rootCount++;
-                    if (p.optBoolean("cgroupAnomaly")) anomalyCount++;
-                    if (rootCandidate && "HIGH".equals(p.optString("risk"))) high++;
+                    if (rootCandidate) { rootCount++; }
+                    if (p.optBoolean("cgroupAnomaly")) { anomalyCount++; }
+                    if (rootCandidate && "HIGH".equals(p.optString("risk"))) { high++; }
                     String risk = p.optString("risk", "UNKNOWN");
                     if (rootCandidate && ("WATCH".equals(risk) || "UNKNOWN".equals(risk))) rootWatch++;
                     if (p.optBoolean("gpuDeviceOpen") || p.optBoolean("gpuActive")) gpuCount++;
@@ -412,7 +643,7 @@ public final class MainActivity extends Activity {
             riskCount.setText(String.format(Locale.getDefault(), "%d", high));
             int riskColor = high > 0 ? RED : rootWatch > 0 || anomalyCount > 0 || incomplete ? AMBER : TEXT;
             riskCount.setTextColor(riskColor);
-            hero.setBackground(shape(SURFACE, high > 0 ? RED : BORDER, 18));
+            hero.setBackground(heroBackground(high > 0 ? RED : BORDER));
             if (!running) {
                 heroStatus.setText("检测已停止");
                 heroDescription.setText(R.string.no_retained_results);
@@ -470,9 +701,11 @@ public final class MainActivity extends Activity {
             }
         } catch (JSONException e) {
             currentReport = null;
+            renderedReport = null;
             updateGpuExecStatus();
             updateGpuFrequencyStatus();
             updateOverlayStatus();
+            updateGlobalGpuStatus();
             environmentCard.setVisibility(View.GONE);
             environmentSummary.setText("");
             recentLifecycleSignals.setVisibility(View.GONE);
@@ -480,8 +713,65 @@ public final class MainActivity extends Activity {
             errorText.setText(getString(R.string.parse_failed, e.getMessage()));
             errorText.setVisibility(View.VISIBLE);
             heroStatus.setText("采集结果异常");
+            heroDescription.setText("等待下一份有效采样，上一帧结果已清空。");
+            heroDescription.setVisibility(View.VISIBLE);
+            hero.setBackground(heroBackground(AMBER));
             riskCount.setText("—");
+            riskCount.setTextColor(MUTED);
+            candidateMetric.setText("—");
+            gpuMetric.setText("—");
+            cpuMetric.setText("—");
+            watchSummary.setText(getString(R.string.monitoring_summary, 0, 0, 0));
+            sampleStatus.setText("本轮数据无效 · 等待下一次采样");
+            permissionStatus.setText(getString(R.string.ordinary_mode, uidText(android.os.Process.myUid())));
+            renderProcesses();
         }
+    }
+
+    /** Keep navigation and persistent controls in sync, including warning expiry between reports. */
+    private void updateDashboardChrome() {
+        boolean running = MonitorService.running;
+        boolean hasSample = currentReport != null && !isStartingReport();
+        boolean environment = currentReport != null && currentReport.optBoolean("environmentAnomaly");
+        JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
+        boolean suspiciousLayer = overlay != null && overlay.optBoolean("suspected");
+        boolean frequency = gpuFrequencyWarning.getVisibility() == View.VISIBLE;
+        boolean highRisk = hasSample && riskCount.getCurrentTextColor() == RED;
+        boolean limited = errorText.getVisibility() == View.VISIBLE;
+        String alert = suspiciousLayer ? "发现可疑图层 · 查看名称依据  ↗"
+                : environment ? "发现环境异常 · 查看冲突依据  ↗"
+                : frequency ? "检测到持续 GPU 高频活动 · 查看依据  ↗"
+                : highRisk ? "发现高风险进程 · 查看进程证据  ↗"
+                : limited ? "采样存在限制 · 查看本次证据  ↗" : "";
+        bindText(alertRibbon, alert);
+        int alertVisibility = alert.isEmpty() ? View.GONE : View.VISIBLE;
+        if (alertRibbon.getVisibility() != alertVisibility) alertRibbon.setVisibility(alertVisibility);
+        bindColor(alertRibbon, suspiciousLayer || environment || frequency || highRisk ? RED : AMBER);
+        int signalColor = suspiciousLayer || environment || frequency || highRisk ? RED
+                : limited || riskCount.getCurrentTextColor() == AMBER ? AMBER : CYAN;
+        signalRadar.setSignalState(running, hasSample, signalColor);
+        bindText(overviewGpuStatus, globalGpuStatus.getText().toString());
+        bindColor(overviewGpuStatus, globalGpuStatus.getCurrentTextColor());
+        bindText(overviewOverlayStatus, overlayStatus.getText().toString());
+        bindColor(overviewOverlayStatus, overlayStatus.getCurrentTextColor());
+        bindText(evidenceSessionStatus, heroStatus.getText().toString());
+        String caption = monitorStopRequested && running ? "SESSION / 正在停止并清空"
+                : !running ? "SESSION / 等待开始"
+                : hasSample ? "SESSION / 实时采样中" : "SESSION / 正在建立基线";
+        bindText(sessionCaption, caption);
+        bindColor(sessionCaption, running ? ACCENT : MUTED);
+        int appearance = running ? 1 : 0;
+        if (controlAppearance != appearance) {
+            controlAppearance = appearance;
+            startButton.setTextColor(running ? RED : BG);
+            startButton.setBackground(ripple(running ? Color.rgb(42, 24, 32) : ACCENT,
+                    running ? Color.rgb(94, 48, 59) : ACCENT, 16));
+            startButton.setCompoundDrawablesRelativeWithIntrinsicBounds(
+                    running ? R.drawable.ic_stop : R.drawable.ic_start, 0, 0, 0);
+            startButton.setCompoundDrawableTintList(ColorStateList.valueOf(running ? RED : BG));
+            startButton.setCompoundDrawablePadding(dp(12));
+        }
+        startButton.setContentDescription(running ? "停止检测并清空本次结果" : "开始本机实时检测");
     }
 
     private boolean isCgroupCheckUnavailable() {
@@ -494,7 +784,7 @@ public final class MainActivity extends Activity {
         JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
         boolean suspicious = overlay != null && overlay.optBoolean("suspected");
         overlayStatus.setTextColor(suspicious ? RED : MUTED);
-        overlayCard.setBackground(shape(suspicious ? Color.rgb(43, 30, 35) : SURFACE, suspicious ? RED : BORDER, 16));
+        overlayCard.setBackground(shape(suspicious ? Color.rgb(42, 24, 32) : SURFACE, suspicious ? RED : BORDER, 18));
         overlayNames.setText("");
         overlayNames.setVisibility(View.GONE);
         if (suspicious) {
@@ -532,7 +822,11 @@ public final class MainActivity extends Activity {
 
     private void showOverlayEvidence() {
         JSONObject overlay = currentReport == null ? null : currentReport.optJSONObject("overlay");
-        if (overlay == null) return;
+        if (overlay == null) {
+            EvidenceSheet.show(this, "图层名称依据", "等待本次检测",
+                    "开始检测后会尝试 Oplus、Nubia 与 ZUI 三条探测路线。名称线索属于启发式判断，接口不可用与未发现可疑名称会分别显示。", false, null, null);
+            return;
+        }
         StringBuilder detail = new StringBuilder("对可疑或无法解释的名称立即提示。名称判断属于启发式，未命中不代表没有悬浮窗。\n\n");
         JSONArray routes = overlay.optJSONArray("routes");
         for (int i = 0; routes != null && i < routes.length(); i++) {
@@ -554,11 +848,7 @@ public final class MainActivity extends Activity {
                     .append(" / UID：").append(row.optInt("ownerUid")).append('\n');
             else detail.append("接口未提供 PID / UID；# 后缀为图层编号。\n");
         }
-        TextView text = label(detail.toString(), 13, TEXT, false);
-        text.setTextIsSelectable(true);
-        text.setPadding(dp(22), dp(16), dp(22), dp(20));
-        ScrollView scroll = new ScrollView(this); scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle("悬浮窗检测依据").setView(scroll).setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, "图层名称依据", "三条探测路线 · 名称启发式", detail.toString(), false, null, null);
     }
 
     private static String overlayRouteState(String state) {
@@ -643,14 +933,7 @@ public final class MainActivity extends Activity {
                         row.optInt("slot"), fps, row.optLong("stableForMs") / 1000.0));
             }
         }
-        TextView text = label(detail.toString(), 13, TEXT, false);
-        text.setTextIsSelectable(true);
-        text.setPadding(dp(20), dp(16), dp(20), dp(16));
-        text.setLineSpacing(dp(3), 1f);
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle(R.string.gpu_frequency_title).setView(scroll)
-                .setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, getString(R.string.gpu_frequency_title), "GPU 槽活动 · 估算频率", detail.toString(), false, null, null);
     }
 
     private JSONObject gpuExecResult() {
@@ -724,14 +1007,15 @@ public final class MainActivity extends Activity {
             }
             if (rows == null || rows.length() == 0) detail.append("\n\n尚无可用样本。");
         } else detail.append("\n开始检测后自动采样，停止后清空。");
-        TextView text = label(detail.toString(), 13, TEXT, false);
-        text.setTextIsSelectable(true); text.setPadding(dp(20), dp(16), dp(20), dp(16));
-        text.setLineSpacing(dp(3), 1f);
-        ScrollView scroll = new ScrollView(this); scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle("GPU 多槽采样").setView(scroll).setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, "GPU 多槽采样", "短窗口观察 · 归属未知", detail.toString(), false, null, null);
     }
 
     private void updateGlobalGpuStatus() {
+        if (currentReport == null || isStartingReport()) {
+            globalGpuStatus.setText(R.string.global_gpu_waiting);
+            globalGpuStatus.setTextColor(MUTED);
+            return;
+        }
         JSONObject global = currentReport == null ? null : currentReport.optJSONObject("globalGpu");
         if (global == null || !global.optBoolean("supported")) {
             globalGpuStatus.setText(R.string.global_gpu_unknown);
@@ -818,14 +1102,7 @@ public final class MainActivity extends Activity {
         } catch (JSONException e) {
             detail.append("原始依据无法解析：").append(e.getMessage());
         }
-        TextView text = label(detail.toString(), 12, TEXT, false);
-        text.setTextIsSelectable(true);
-        text.setPadding(dp(20), dp(16), dp(20), dp(16));
-        text.setLineSpacing(dp(3), 1f);
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle("环境异常 · 原始依据")
-                .setView(scroll).setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, "环境异常", "进程存在性与线程类型 · 原始依据", detail.toString(), true, null, null);
     }
 
     private void showGlobalGpuEvidence() {
@@ -843,14 +1120,7 @@ public final class MainActivity extends Activity {
                 + "高频提示按同一用户槽的 retired 计数推进速率统计：每秒至少 "
                 + compact(GpuHighFrequency.MIN_RATE_PER_SECOND) + " 次，连续至少 "
                 + GpuHighFrequency.MIN_DURATION_MS / 1000 + " 秒；速率单位是计数增量/秒。\n\n" + raw;
-        TextView text = label(description, 12, TEXT, false);
-        text.setTextIsSelectable(true);
-        text.setPadding(dp(20), dp(16), dp(20), dp(16));
-        text.setLineSpacing(dp(3), 1f);
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle("全局 GPU 证据 · 归属未知")
-                .setView(scroll).setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, "全局 GPU 证据", "整机活动 · 未归属任何 PID", description, true, null, null);
     }
 
     private void renderProcesses() {
@@ -890,7 +1160,7 @@ public final class MainActivity extends Activity {
                 processRows.add(added);
                 marginAdd(processList, added.item, 10);
             }
-            processRows.get(i).bind(visible.get(i));
+            processRows.get(i).bind(visible.get(i), i + 1);
         }
     }
 
@@ -929,11 +1199,13 @@ public final class MainActivity extends Activity {
     /** One holder per displayed index; the current sorted row replaces its previous binding. */
     private final class ProcessRow {
         final LinearLayout item = card();
+        final TextView rank = mono("", 12, CYAN);
         final TextView name = label("", 16, TEXT, true);
         final TextView riskTag = badge("", MUTED);
         final TextView identity = label("", 11, MUTED, false);
         final TextView avcHint = label("", 11, AMBER, false);
-        final TextView cpu = label("", 18, TEXT, true);
+        final TextView cpu = mono("", 24, TEXT);
+        final CpuLoadView load = new CpuLoadView(MainActivity.this);
         final TextView gpuTag = label("", 11, MUTED, false);
         final TextView lifecycleLine = label("", 12, MUTED, false);
         final TextView explanation = label("", 12, MUTED, false);
@@ -941,22 +1213,32 @@ public final class MainActivity extends Activity {
         int backgroundKind;
 
         ProcessRow() {
-            LinearLayout nameRow = row();
+            LinearLayout rankRow = row();
+            rankRow.addView(rank, new LinearLayout.LayoutParams(dp(46), -2));
+            riskTag.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            riskTag.setMaxLines(3);
+            rankRow.addView(riskTag, new LinearLayout.LayoutParams(0, -2, 1));
+            item.addView(rankRow);
             name.setMaxLines(2);
-            nameRow.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
-            riskTag.setMaxWidth(dp(150));
-            LinearLayout.LayoutParams tagParams = new LinearLayout.LayoutParams(-2, -2);
-            tagParams.leftMargin = dp(8);
-            nameRow.addView(riskTag, tagParams);
-            item.addView(nameRow);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            marginAdd(item, name, 12);
             marginAdd(item, identity, 6);
             avcHint.setMaxLines(2);
             avcHint.setVisibility(View.GONE);
             marginAdd(item, avcHint, 6);
             LinearLayout stats = row();
+            cpu.setMaxLines(1);
+            cpu.setAutoSizeTextTypeUniformWithConfiguration(14, 24, 1, TypedValue.COMPLEX_UNIT_SP);
             stats.addView(cpu, new LinearLayout.LayoutParams(0, -2, 1));
-            stats.addView(gpuTag);
-            marginAdd(item, stats, 13);
+            TextView detailLink = label("证据  ↗", 11, CYAN, true);
+            LinearLayout.LayoutParams linkParams = new LinearLayout.LayoutParams(-2, -2);
+            linkParams.leftMargin = dp(12);
+            stats.addView(detailLink, linkParams);
+            marginAdd(item, stats, 16);
+            LinearLayout.LayoutParams loadParams = new LinearLayout.LayoutParams(-1, dp(8));
+            loadParams.topMargin = dp(10);
+            item.addView(load, loadParams);
+            marginAdd(item, gpuTag, 10);
             marginAdd(item, lifecycleLine, 8);
             explanation.setMaxLines(3);
             explanation.setLineSpacing(dp(2), 1f);
@@ -968,8 +1250,9 @@ public final class MainActivity extends Activity {
             item.setFocusable(true);
         }
 
-        void bind(JSONObject p) {
+        void bind(JSONObject p, int position) {
             process = p;
+            bindText(rank, String.format(Locale.US, "%02d /", position));
             String risk = p.optString("risk", "UNKNOWN");
             boolean avcRisk = "avc_root_domain_cpu_global_memstore".equals(p.optString("riskBasis"));
             boolean cgroupAnomaly = p.optBoolean("cgroupAnomaly");
@@ -977,9 +1260,9 @@ public final class MainActivity extends Activity {
             int color = kernelMismatch || "HIGH".equals(risk) ? RED : "SUSPECT".equals(risk) || "WATCH".equals(risk) ? AMBER : MUTED;
             int nextBackground = kernelMismatch || "HIGH".equals(risk) ? 1 : "SUSPECT".equals(risk) ? 2 : 0;
             if (nextBackground != backgroundKind) {
-                item.setBackground(nextBackground == 1 ? shape(Color.rgb(43, 30, 35), Color.rgb(111, 54, 65), 16)
-                        : nextBackground == 2 ? shape(Color.rgb(43, 37, 27), Color.rgb(98, 80, 48), 16)
-                        : shape(SURFACE, BORDER, 16));
+                item.setBackground(nextBackground == 1 ? shape(Color.rgb(42, 24, 32), Color.rgb(94, 48, 59), 18)
+                        : nextBackground == 2 ? shape(Color.rgb(40, 33, 24), Color.rgb(94, 75, 45), 18)
+                        : shape(SURFACE, BORDER, 18));
                 backgroundKind = nextBackground;
             }
             String pidLabel = "PID " + p.optInt("pid");
@@ -1004,7 +1287,8 @@ public final class MainActivity extends Activity {
             int avcVisibility = showAvcHint ? View.VISIBLE : View.GONE;
             if (avcHint.getVisibility() != avcVisibility) avcHint.setVisibility(avcVisibility);
             bindText(cpu, "CPU  " + MainActivity.cpu(p.optDouble("cpuPercent", -1)));
-            bindColor(cpu, "HIGH".equals(risk) ? RED : TEXT);
+            bindColor(cpu, "HIGH".equals(risk) ? RED : ACCENT);
+            load.setLoad(cpuSortValue(p), "HIGH".equals(risk) ? RED : CYAN);
             String gpu = p.optBoolean("gpuActive") ? "该进程 GPU 有活动" : p.optBoolean("gpuDeviceOpen") ? "GPU 客户端已确认" : "";
             bindText(gpuTag, gpu);
             bindColor(gpuTag, p.optBoolean("gpuDeviceOpen") ? ACCENT : MUTED);
@@ -1032,6 +1316,7 @@ public final class MainActivity extends Activity {
             bindText(explanation, reason);
             bindColor(explanation, kernelMismatch ? RED : cgroupAnomaly ? AMBER : MUTED);
             String description = p.optString("name") + "，" + riskName(risk)
+                    + "，CPU " + MainActivity.cpu(cpuSortValue(p))
                     + (kernelMismatch ? "，环境异常" : "")
                     + (cgroupAnomaly ? "，" + getString(R.string.cgroup_anomaly_monitoring) : "")
                     + "，点击查看进程证据";
@@ -1121,16 +1406,10 @@ public final class MainActivity extends Activity {
         }
         detail.append("\n可执行文件：\n").append(p.optString("exe").isEmpty() ? "不可读取" : p.optString("exe")).append("\n\n");
         detail.append("命令行：\n").append(p.optString("cmdline").isEmpty() ? "不可读取" : p.optString("cmdline")).append("\n\n");
-        TextView text = label(detail.toString(), 13, TEXT, false);
-        text.setText(highlightGpuConfirmation(detail.toString()));
-        text.setTextIsSelectable(true);
-        text.setLineSpacing(dp(3), 1f);
-        text.setPadding(dp(22), dp(16), dp(22), dp(20));
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle(p.optString("name", "进程详情"))
-                .setView(scroll).setPositiveButton("关闭", null)
-                .setNeutralButton("原始记录", (dialog, which) -> showRawProcess(p)).show();
+        String title = p.optString("name", "").trim();
+        if (title.isEmpty()) title = "PID " + p.optInt("pid");
+        EvidenceSheet.show(this, title, "进程证据 / " + riskName(p.optString("risk")),
+                highlightGpuConfirmation(detail.toString()), false, "原始记录", () -> showRawProcess(p));
     }
 
     private void appendCgroupEvidence(StringBuilder detail, JSONObject process) {
@@ -1256,13 +1535,7 @@ public final class MainActivity extends Activity {
     private void showRawProcess(JSONObject p) {
         String content;
         try { content = p.toString(2); } catch (JSONException e) { content = p.toString(); }
-        TextView text = label(content, 11, TEXT, false);
-        text.setTypeface(Typeface.MONOSPACE);
-        text.setTextIsSelectable(true);
-        text.setPadding(dp(20), dp(16), dp(20), dp(16));
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(text);
-        new AlertDialog.Builder(this).setTitle("进程原始记录").setView(scroll).setPositiveButton("关闭", null).show();
+        EvidenceSheet.show(this, "进程原始记录", "JSON / 本次采样快照", content, true, null, null);
     }
 
     private static double cpuSortValue(JSONObject process) {
@@ -1360,30 +1633,79 @@ public final class MainActivity extends Activity {
         text.setText(value);
         text.setTextColor(color);
         text.setTextSize(size);
+        text.setIncludeFontPadding(false);
         text.setFontFeatureSettings("tnum");
         if (bold) text.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         return text;
     }
+    private TextView mono(String value, int size, int color) {
+        TextView text = label(value, size, color, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        return text;
+    }
     private LinearLayout card() {
         LinearLayout card = vertical();
-        card.setPadding(dp(18), dp(17), dp(18), dp(17));
-        card.setBackground(shape(SURFACE, BORDER, 16));
+        card.setPadding(dp(18), dp(18), dp(18), dp(18));
+        card.setBackground(shape(SURFACE, BORDER, 18));
+        card.setForeground(new RippleDrawable(ColorStateList.valueOf(Color.argb(24, 128, 216, 235)),
+                null, shape(Color.WHITE, Color.WHITE, 18)));
         return card;
     }
     private TextView badge(String text, int color) {
         TextView badge = label(text, 10, color, true);
-        badge.setPadding(dp(9), dp(5), dp(9), dp(5));
+        badge.setPadding(dp(10), dp(7), dp(10), dp(7));
         badge.setBackground(shape(BG, BORDER, 16));
         badge.setGravity(Gravity.CENTER);
         return badge;
     }
-    private TextView metric(LinearLayout parent, String title) {
+    private TextView metric(LinearLayout parent, String title, String code, int color) {
+        boolean stacked = parent.getOrientation() == LinearLayout.VERTICAL;
         LinearLayout column = vertical();
-        TextView value = label("—", 23, TEXT, true);
-        column.addView(value);
-        marginAdd(column, label(title, 10, MUTED, false), 5);
-        parent.addView(column, new LinearLayout.LayoutParams(0, -2, 1));
+        column.setPadding(dp(10), dp(14), dp(10), dp(14));
+        column.setBackground(shape(SURFACE, BORDER, 16));
+        column.addView(mono(code, 9, color));
+        TextView value = mono("—", 26, color);
+        value.setMaxLines(1);
+        value.setAutoSizeTextTypeUniformWithConfiguration(13, 26, 1, TypedValue.COMPLEX_UNIT_SP);
+        LinearLayout.LayoutParams valueParams = new LinearLayout.LayoutParams(-1, stacked ? -2 : dp(42));
+        value.setMinHeight(dp(42));
+        valueParams.topMargin = dp(8);
+        column.addView(value, valueParams);
+        TextView caption = label(title, 10, MUTED, false);
+        caption.setMinLines(stacked ? 1 : 2);
+        caption.setLineSpacing(dp(2), 1f);
+        marginAdd(column, caption, 5);
+        LinearLayout.LayoutParams params = stacked ? new LinearLayout.LayoutParams(-1, -2)
+                : new LinearLayout.LayoutParams(0, -1, 1);
+        if (parent.getChildCount() > 0) {
+            if (stacked) params.topMargin = dp(8);
+            else params.leftMargin = dp(8);
+        }
+        parent.addView(column, params);
         return value;
+    }
+    private LinearLayout sectionHeading(String title, String code) {
+        LinearLayout heading = vertical();
+        heading.addView(mono(code, 9, MUTED));
+        TextView text = label(title, 18, TEXT, true);
+        if (Build.VERSION.SDK_INT >= 28) text.setAccessibilityHeading(true);
+        marginAdd(heading, text, 6);
+        return heading;
+    }
+    private LinearLayout channelHeading(String number, String title, String code) {
+        LinearLayout heading = row();
+        TextView index = mono(number, 13, CYAN);
+        index.setGravity(Gravity.CENTER);
+        index.setBackground(shape(BG, BORDER, 10));
+        heading.addView(index, new LinearLayout.LayoutParams(dp(34), dp(34)));
+        LinearLayout names = vertical();
+        names.addView(label(title, 15, TEXT, true));
+        marginAdd(names, mono(code, 9, MUTED), 4);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
+        params.leftMargin = dp(12);
+        heading.addView(names, params);
+        heading.addView(label("↗", 18, MUTED, false));
+        return heading;
     }
     private Button button(String text, boolean primary) {
         Button button = new Button(this);
@@ -1392,12 +1714,25 @@ public final class MainActivity extends Activity {
         button.setTextSize(14);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setTextColor(primary ? BG : TEXT);
-        button.setBackground(shape(primary ? ACCENT : SURFACE, primary ? ACCENT : BORDER, 11));
-        button.setPadding(dp(8), 0, dp(8), 0);
-        button.setMinHeight(0);
-        button.setMinimumHeight(0);
+        button.setBackground(ripple(primary ? ACCENT : SURFACE, primary ? ACCENT : BORDER, 14));
+        button.setPadding(dp(14), dp(12), dp(14), dp(12));
+        button.setMinHeight(dp(48));
+        button.setMinimumHeight(dp(48));
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
         button.setStateListAnimator(null);
         return button;
+    }
+    private RippleDrawable ripple(int fill, int stroke, int radius) {
+        return new RippleDrawable(ColorStateList.valueOf(Color.argb(35, 128, 216, 235)),
+                shape(fill, stroke, radius), shape(Color.WHITE, Color.WHITE, radius));
+    }
+    private GradientDrawable heroBackground(int stroke) {
+        GradientDrawable background = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{Color.rgb(29, 44, 47), Color.rgb(15, 25, 36)});
+        background.setCornerRadius(dp(24));
+        background.setStroke(dp(1), stroke);
+        return background;
     }
     private GradientDrawable shape(int fill, int stroke, int radius) {
         GradientDrawable shape = new GradientDrawable();
