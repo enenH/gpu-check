@@ -140,6 +140,7 @@ final class RiskEngine {
             p.remove("riskConfidence");
             String risk = "MONITORING", reason = sortableCpu(p) < 0
                     ? "正在建立 CPU 基线或当前 CPU 时钟不可读取。" : "正在持续采样该进程的 CPU 使用率。";
+            if (p.optBoolean("oemOnly")) reason = "厂商服务发现的进程候选；CPU、有效 UID 与连续身份尚未核验。";
             int consecutive = 0;
             if (rootCandidate) {
                 rootCount++;
@@ -345,7 +346,7 @@ final class RiskEngine {
     }
 
     private static boolean isSelf(JSONObject p, JSONObject report) {
-        return MonitoredProcessFilter.isSelf(p.optInt("pid", -1), p.optInt("uid", -1),
+        return p.optBoolean("oemSelfProcess") || MonitoredProcessFilter.isSelf(p.optInt("pid", -1), p.optInt("uid", -1),
                 report.optInt("collectorPid", -1), android.os.Process.myPid(), android.os.Process.myUid());
     }
 
@@ -357,7 +358,7 @@ final class RiskEngine {
     private JSONArray mergeCurrentCpuRows(JSONObject report) throws JSONException {
         JSONArray input = report.optJSONArray("processes"), cpu = report.optJSONArray("cpuSamples");
         report.put("nativeMatchedCandidates", report.optInt("matchedCandidates", input == null ? 0 : input.length()))
-                .put("nativeReturnedCandidates", input == null ? 0 : input.length())
+                .put("nativeReturnedCandidates", report.optInt("nativeReturnedCandidates", input == null ? 0 : input.length()))
                 .put("nativeCandidatesTruncated", report.optBoolean("candidatesTruncated"));
         JSONArray merged = new JSONArray();
         Set<Integer> presentPids = new HashSet<>();
@@ -412,6 +413,19 @@ final class RiskEngine {
                 }
             }
             if (row.has("threadTypeCheck")) observation.put("threadTypeCheck", row.optJSONObject("threadTypeCheck"));
+            // OEM annotations reach CPU-only rows only after the existing native identity,
+            // current CPU-window, self-exclusion and exit checks above have accepted them.
+            if (row.optBoolean("oemIdentityBound")) {
+                java.util.Iterator<String> fields = row.keys();
+                while (fields.hasNext()) {
+                    String field = fields.next();
+                    if (field.startsWith("reported") || field.startsWith("oem") || field.equals("ppidSource"))
+                        observation.put(field, row.opt(field));
+                }
+                String reportedName = row.optString("reportedName");
+                if (!row.optBoolean("reportedNameConflict") && !reportedName.trim().isEmpty())
+                    observation.put("name", reportedName);
+            }
             merged.put(observation); presentPids.add(pid); added++;
             if (!isSelf(observation, report) && isRoot(observation)) addedRoots++;
         }

@@ -63,6 +63,7 @@ public final class MainActivity extends Activity {
     private TextView overviewGpuStatus;
     private TextView overviewOverlayStatus;
     private TextView evidenceSessionStatus;
+    private TextView oemProcessStatus;
     private SignalRadarView signalRadar;
     private int selectedPage;
     private int controlAppearance = -1;
@@ -405,7 +406,7 @@ public final class MainActivity extends Activity {
         intro.addView(mono("CPU / LIVE RANKING", 10, CYAN));
         listTitle = label(getString(R.string.candidates_title), 18, TEXT, true);
         marginAdd(intro, listTitle, 10);
-        TextView note = label("按 CPU 实时排序 · 点击进程查看完整证据\n单核口径，负载可超过 100%；未知值保留为 —。", 12, MUTED, false);
+        TextView note = label("按 CPU 实时排序 · 点击进程查看完整证据\n每项显示 UID；厂商返回值单独标注，未取得时显示未知。\nCPU 为单核口径，负载可超过 100%。", 12, MUTED, false);
         note.setLineSpacing(dp(3), 1f);
         marginAdd(intro, note, 8);
         page.addView(intro);
@@ -431,6 +432,16 @@ public final class MainActivity extends Activity {
         errorText.setVisibility(View.GONE);
         marginAdd(session, errorText, 12);
         page.addView(session);
+
+        LinearLayout oem = card();
+        oem.addView(channelHeading("CPU", "厂商进程探测", "PROCESS INFO"));
+        oemProcessStatus = label("厂商进程探测 · 等待开始", 14, MUTED, false);
+        oemProcessStatus.setLineSpacing(dp(3), 1f);
+        marginAdd(oem, oemProcessStatus, 14);
+        marginAdd(oem, label("五条独立路线 · 查看身份与覆盖范围  ↗", 11, CYAN, true), 14);
+        oem.setOnClickListener(v -> showOemProcessEvidence());
+        oem.setFocusable(true);
+        marginAdd(page, oem, 12);
 
         LinearLayout global = card();
         global.addView(channelHeading("01", "全局 GPU", "MEMSTORE"));
@@ -755,6 +766,7 @@ public final class MainActivity extends Activity {
         bindText(overviewOverlayStatus, overlayStatus.getText().toString());
         bindColor(overviewOverlayStatus, overlayStatus.getCurrentTextColor());
         bindText(evidenceSessionStatus, heroStatus.getText().toString());
+        updateOemProcessStatus();
         String caption = monitorStopRequested && running ? "SESSION / 正在停止并清空"
                 : !running ? "SESSION / 等待开始"
                 : hasSample ? "SESSION / 实时采样中" : "SESSION / 正在建立基线";
@@ -863,6 +875,89 @@ public final class MainActivity extends Activity {
             case "CANCELLED": return "已停止";
             case "COOLDOWN": return "等待下一轮日志收集";
             default: return "回复校验失败";
+        }
+    }
+
+    private void updateOemProcessStatus() {
+        JSONObject oem = currentReport == null ? null : currentReport.optJSONObject("oemProcesses");
+        if (oem == null || !MonitorService.running) {
+            bindText(oemProcessStatus, "厂商进程探测 · " + (MonitorService.running ? "正在探测" : "等待开始"));
+            return;
+        }
+        JSONArray routes = oem.optJSONArray("routes");
+        int available = 0, checking = 0;
+        for (int i = 0; routes != null && i < routes.length(); i++) {
+            JSONObject route = routes.optJSONObject(i);
+            if (route == null) continue;
+            if (route.optBoolean("available")) available++;
+            if ("CHECKING".equals(route.optString("status"))) checking++;
+        }
+        int nativeUids = 0, reportedUids = 0, unknownUids = 0;
+        JSONArray rows = currentReport.optJSONArray("processes");
+        for (int i = 0; rows != null && i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i);
+            if (row == null) continue;
+            if (row.optInt("uid", -1) >= 0) nativeUids++;
+            else if (row.optInt("reportedUid", -1) >= 0 && !row.optBoolean("reportedUidConflict")) reportedUids++;
+            else unknownUids++;
+        }
+        bindText(oemProcessStatus, "厂商进程探测 · " + available + "/5 条可用"
+                + (checking > 0 ? " · " + checking + " 条探测中" : "")
+                + "\nUID 已读取 " + nativeUids + " · 厂商提供 " + reportedUids + " · 未知 " + unknownUids);
+    }
+
+    private void showOemProcessEvidence() {
+        JSONObject oem = currentReport == null ? null : currentReport.optJSONObject("oemProcesses");
+        StringBuilder detail = new StringBuilder("通过厂商服务补充进程名称、UID 和父进程关系。每条路线独立采集；不可用或没有返回记录不代表设备上没有其他进程。\n");
+        JSONArray routes = oem == null ? null : oem.optJSONArray("routes");
+        for (int i = 0; routes != null && i < routes.length(); i++) {
+            JSONObject route = routes.optJSONObject(i);
+            if (route == null) continue;
+            JSONArray rows = route.optJSONArray("rows");
+            detail.append('\n').append(oemRouteName(route.optString("route"))).append("：")
+                    .append(oemRouteState(route.optString("status"))).append('\n')
+                    .append("返回记录：").append(rows == null ? 0 : rows.length()).append('\n');
+            if (!route.optString("detail").isEmpty()) detail.append(route.optString("detail")).append('\n');
+            if (route.has("candidateCount")) detail.append("候选 PID：").append(route.optInt("candidateCount")).append('\n');
+            if (route.has("candidateBatchCount")) detail.append("本轮候选批次：").append(route.optInt("candidateBatchCount")).append('\n');
+            int queried = route.optInt("candidatesQueried", route.optInt("queriedCandidates", -1));
+            if (queried >= 0) detail.append("本轮已查询：").append(queried).append('\n');
+        }
+        if (routes == null) detail.append("\n等待本次检测。\n");
+        detail.append("\nUID 来源：优先显示本地读取的有效 UID；只有厂商返回值时标注“厂商”。未取得或返回值冲突时保持未知。厂商 UID 不单独作为有效 UID 或 root 身份证明。\n")
+                .append("CPU 状态中的厂商数值不换算成本应用 CPU 百分比；进程排行继续使用原生时钟采样。\n")
+                .append("Vivo 和 PerfShielder 针对候选 PID 查询，覆盖范围不等于完整枚举。父子关系也不证明 GPU 归属。\n");
+        EvidenceSheet.show(this, "厂商进程探测", "五条路线 · 本次采样", detail.toString(), false,
+                oem == null ? null : "原始记录", oem == null ? null : () -> {
+                    try { EvidenceSheet.show(this, "厂商进程原始记录", "本次采样", oem.toString(2), true, null, null); }
+                    catch (JSONException ignored) { }
+                });
+    }
+
+    private static String oemRouteName(String route) {
+        switch (route) {
+            case "miui_cpu": return "小米 CPU 状态";
+            case "miui_memory": return "小米父进程关系";
+            case "oplus_cpu": return "Oplus CPU 统计";
+            case "mindsync": return "红魔 MindSync";
+            case "vivo_rms": return "Vivo RMS";
+            default: return route;
+        }
+    }
+
+    private static String oemRouteState(String state) {
+        switch (state) {
+            case "AVAILABLE": case "OK": return "已取得记录";
+            case "PARTIAL": return "已取得部分记录";
+            case "NO_DATA": case "EMPTY": return "本轮无记录";
+            case "CHECKING": return "正在探测";
+            case "BLOCKED": case "DENIED": return "访问被拒绝";
+            case "UNSUPPORTED": case "UNSUPPORTED_PROTOCOL": return "接口不可用";
+            case "TIMEOUT": return "查询超时";
+            case "STALE": return "数据已过期";
+            case "CANCELLED": return "已停止";
+            case "NO_CANDIDATES": return "等待候选进程";
+            default: return "回复不可用（" + state + "）";
         }
     }
 
@@ -1192,6 +1287,14 @@ public final class MainActivity extends Activity {
         if (!value.contentEquals(view.getText())) view.setText(value);
     }
 
+    static String processUidLabel(JSONObject process) {
+        int uid = process.optInt("uid", -1);
+        if (uid >= 0) return "UID " + uid;
+        if (process.optBoolean("reportedUidConflict")) return "UID 未知（来源冲突）";
+        int reported = process.optInt("reportedUid", -1);
+        return reported >= 0 ? "UID " + reported + "（厂商）" : "UID 未知";
+    }
+
     private static void bindColor(TextView view, int color) {
         if (view.getCurrentTextColor() != color) view.setTextColor(color);
     }
@@ -1271,9 +1374,7 @@ public final class MainActivity extends Activity {
             bindText(name, processName);
             bindText(riskTag, kernelMismatch ? getString(R.string.environment_anomaly) : riskName(risk));
             bindColor(riskTag, color);
-            String identityText = processName.equals(pidLabel) ? "" : pidLabel;
-            int uid = p.optInt("uid", -1);
-            if (uid >= 0) identityText += (identityText.isEmpty() ? "" : "  ·  ") + "UID " + uid;
+            String identityText = (processName.equals(pidLabel) ? "" : pidLabel + "  ·  ") + processUidLabel(p);
             String background = backgroundName(p.optString("background"));
             if (!background.isEmpty()) identityText += (identityText.isEmpty() ? "" : "  ·  ") + background;
             bindText(identity, identityText);
@@ -1316,6 +1417,7 @@ public final class MainActivity extends Activity {
             bindText(explanation, reason);
             bindColor(explanation, kernelMismatch ? RED : cgroupAnomaly ? AMBER : MUTED);
             String description = p.optString("name") + "，" + riskName(risk)
+                    + "，PID " + p.optInt("pid") + "，" + processUidLabel(p)
                     + "，CPU " + MainActivity.cpu(cpuSortValue(p))
                     + (kernelMismatch ? "，环境异常" : "")
                     + (cgroupAnomaly ? "，" + getString(R.string.cgroup_anomaly_monitoring) : "")
@@ -1341,7 +1443,15 @@ public final class MainActivity extends Activity {
         detail.append('\n');
         detail.append("PID：").append(p.optInt("pid")).append('\n');
         int uid = p.optInt("uid", -1);
-        if (uid >= 0) detail.append("有效 UID：").append(uid).append('\n');
+        detail.append("有效 UID：").append(uid >= 0 ? Integer.toString(uid) : "未知").append('\n');
+        detail.append("有效 UID 来源：").append(p.optString("uidSource", "unknown")).append('\n');
+        int reportedUid = p.optInt("reportedUid", -1);
+        if (reportedUid >= 0) detail.append("厂商返回 UID：").append(reportedUid).append("（来源：")
+                .append(p.optString("reportedUidSource", "未知")).append("）\n");
+        if (p.optBoolean("reportedUidConflict")) detail.append("厂商 UID 来源冲突：保留原始依据，不据此确认身份。\n");
+        if (p.optInt("reportedPpid", -1) >= 0) detail.append("厂商返回父进程 PID：").append(p.optInt("reportedPpid")).append('\n');
+        if (p.optBoolean("reportedPpidConflict")) detail.append("厂商父进程记录存在冲突，未合并为一个关系。\n");
+        if (p.has("oemEvidence")) detail.append("厂商进程依据：").append(p.opt("oemEvidence")).append('\n');
         String uidIdentity = uid == 0 ? "有效 UID 已确认为 0" : uid < 0 ? "" : "已知有效 UID 非 0";
         if (uid < 0 && isRootCandidate(p)
                 && (p.optBoolean("avcRootDomainHint") || "avc_root_domain_cpu_global_memstore".equals(p.optString("riskBasis")))) {
@@ -1552,7 +1662,7 @@ public final class MainActivity extends Activity {
 
     private static boolean isVisibleProcess(JSONObject process, int collectorPid) {
         int pid = process.optInt("pid", -1);
-        boolean self = MonitoredProcessFilter.isSelf(pid, process.optInt("uid", -1), collectorPid,
+        boolean self = process.optBoolean("oemSelfProcess") || MonitoredProcessFilter.isSelf(pid, process.optInt("uid", -1), collectorPid,
                 android.os.Process.myPid(), android.os.Process.myUid());
         return MonitoredProcessFilter.acceptsCpu(pid, self)
                 && !KernelThreadPolicy.KERNEL.equals(process.optString("threadType"));

@@ -92,7 +92,17 @@ Manifest 不声明任何权限；不申请通知、存储或读取全设备日�
    FPS是GPU槽变化节奏的估算，一个显示帧可能对应多个命令批次；不是SurfaceFlinger呈现帧率，不提供PID归属，不单独证明悬浮窗或外挂。点击红字可查看槽号、持续时间及依据。
    报告位于globalGpu.slotFrequency，保留原始变化次数、频率、窗口时刻、有效性及前后自身槽证据；不合并其他槽速率，不增加进程高风险数量。
 
-界面（1.7.0 信号指挥舱）
+11. 厂商进程探测（cpubusy）：在五条独立工作线程中实际尝试小米ProcessManager、小米PerfShielder、Oplus CPU Tracker、红魔MindSync、Vivo RMS，不按品牌跳过。
+   小米CPU状态补充PID、厂商UID、名称与原始数值；PerfShielder按候选PID读取Bundle中的PID/PPID，记录父子关系，不读取任意地址空间。
+   Oplus按原协议两次刷新CPU Tracker并读取统计字符串中的PID/名称；MindSync依次合并init、mem、cpu统计；Vivo逐个查询候选PID的RunningAppProcessInfo。
+   交易号从当前系统框架的实际常量恢复，反射受限时只读解析系统jar的DEX常量；无法确定协议时记录不可用，不遍历猜测交易号。
+   MindSync另保留原样本的NX769J完整固件fingerprint适配，仅该完整构建标识吻合时使用已恢复的固定交易号。
+   各路线固定工作线程与全App忙标记，Binder阻塞不会阻塞CPU采样或无限创建线程；结果过期、停止和会话切换会撤销旧数据。
+   同一PID的异步元数据只在连续身份匹配时合入；退出、PID复用和来源冲突不能沿用旧身份。厂商新发现的候选保持CPU及有效身份未知。
+   厂商UID保存在reportedUid及来源字段，绝不替代原生有效uid或自动提升root/GPU风险；厂商CPU数值也不作为原生CPU百分比。
+   oemProcesses保留每路线状态、覆盖范围、记录和时刻；Vivo/PerfShielder是候选查询，不能当作全量枚举。
+
+界面（1.8.0 信号指挥舱）
 原生 Java / Android View 界面，深蓝黑背景、青柠操作色、冰蓝仪表和独立红色告警。
 在同一 Activity 内切换“总览 / 进程 / 证据”，切换页签不会停止采集；底部始终保留开始/停止按钮。
 总览突出高风险进程数、监听数量、GPU归属证据和最高CPU，并呈现图层、GPU活动及环境异常。
@@ -106,13 +116,31 @@ CPU列表无固定数量截断；GPU生命周期观察仍仅针对root/cgroup异
 不提供告警历史、保存报告或阈值设置；证据页只展示当前会话已经采集的数据。
 不再提供“查看全部 root 候选”开关；移除总览中的 AVC root 执行域说明和固定的英文权限提示。
 全局 memstore 状态只在总览展示，进程卡片的 GPU 标签仅反映该 PID 的归属证据。
-每张进程卡片的PID只显示一次；隐藏未知GPU归属标签，所有已采集到的AVC域均展示，包括非root域。
+每张进程卡片的PID只显示一次，始终显示UID：已读取数值优先，其次为明确标注“厂商”的返回值，否则显示“UID 未知”。
+进程详情保留UID来源、父进程关系和厂商依据；证据页新增五条厂商路线状态及UID覆盖数量。来源冲突保持未知，不拼凑身份。
+隐藏未知GPU归属标签，所有已采集到的AVC域均展示，包括非root域。
 不再隐藏CPU低于0.2%的进程；不足10个时也可显示低负载、零CPU和未知CPU进程。
 结果仅保存在当前检测的内存中，停止或切后台后清空，不恢复上次结果。
 升级时清除旧版本留下的私有报告缓存。本应用、采集器及其他同UID进程与线程不参与CPU监听、排行或总数统计，也不参与root/cgroup风险认定。
 进程名或 UID 不可读取时，界面不根据测试对象的外部信息补造标签。
 报告解析失败时立即清空上一帧指标、排行和GPU状态，避免无效数据保留旧结论。
 视觉系统、布局说明和UI回归命令见 docs/UI.md。
+
+厂商进程验收
+    .\gradlew.bat --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest -PgpuCheckTestRunner=com.gpucheck.app.OemProcessInstrumentation
+    python scripts/test-oem-process.py --duration 25 --require-oplus
+测试脚本限定本次一加830dcfd7/CPH2415；App及测试runner以普通应用UID运行，ADB只负责安装、启动及导出独立验证记录。
+模拟协议/冲突/PID复用/超时/缓存检查与真实Service/UI验收分开记录；其他厂商路线的协议检查不替代对应真机成功证据。
+默认结果在build\oem-process-device-test，包含路线与进程JSONL、UID卡片记录、三页截图、停止/重启/后台清理回执。
+
+厂商进程与UID展示验收（2026-11-15，1.8.0）
+一加CPH2415/Android15：正式App UID10056、untrusted_app、CapEff=0，无新增权限。五条路线均实际尝试。
+Oplus可用，每轮最多返回10条，本轮最多9条与原生身份关联；其余四路在本机未取得服务，未声称其他ROM真机成功。
+16份真实采样监听297–298个外部用户态进程，19帧UI/190张进程卡片核对通过；独立shell前后身份稳定的11个PID名称全部一致。
+本机有效UID与厂商UID均未取得，所有进程明确显示UID未知；数值UID、厂商UID、来源冲突等5种UI状态由明确标记的模拟检查覆盖。
+734项模拟协议/合并/并发/TTL检查、256项现有主机规则检查、普通UID原生self-test、Debug/Release构建及Lint（0错误）通过。
+停止、重启、HOME离开后的Service与Activity清理通过；最终APK与已安装包SHA256一致，产物dist\GpuCheck.apk。
+证据：build\oem-process-device-test\final；截图与摘要另存dist\oem-process-*.png及dist\oem-process-verification.json。
 
 构建
 JDK推荐17或21（本机JDK 25也已验证）、Android SDK 35、Build Tools 36.0.0、默认NDK 29.0.13113456、AGP 9.5.1、Gradle 9.9.1。

@@ -38,6 +38,7 @@ public final class MonitorService extends Service {
     private volatile Process process;
     private volatile AvcEvidence avcEvidence;
     private volatile OverlayMonitor overlayMonitor;
+    private volatile OemProcessMonitor oemProcessMonitor;
     private volatile GpuExecMonitor gpuExecMonitor;
     private volatile int generation;
     private volatile long lastOutputAt;
@@ -86,6 +87,8 @@ public final class MonitorService extends Service {
         final double configuredThreshold = threshold;
         OverlayMonitor sessionOverlay = new OverlayMonitor(this);
         overlayMonitor = sessionOverlay;
+        OemProcessMonitor sessionProcesses = new OemProcessMonitor(this);
+        oemProcessMonitor = sessionProcesses;
         gpuExecMonitor = new GpuExecMonitor(() -> queueFrequencyPublication(token));
         try {
             JSONObject initial = new JSONObject();
@@ -95,6 +98,7 @@ public final class MonitorService extends Service {
                     .put("windows", windows).put("intervalMs", interval).put("highRiskCount", 0)
                     .put("processes", new JSONArray())
                     .put("overlay", sessionOverlay.snapshot())
+                    .put("oemProcesses", sessionProcesses.snapshot())
                     .put("errors", new JSONArray());
             publish(initial, token);
         } catch (Exception e) { Log.e("GpuCheck", "Initial report", e); }
@@ -156,6 +160,8 @@ public final class MonitorService extends Service {
                     receivedSample = true;
                     SelfGpuSlots.enrich(raw);
                     localEvidence.enrich(raw);
+                    OemProcessMonitor oem = oemProcessMonitor;
+                    if (oem != null && token == generation) oem.enrich(raw);
                     JSONObject report = engine.process(raw);
                     GpuExecMonitor exec = gpuExecMonitor;
                     if (exec != null && token == generation) exec.enrich(report);
@@ -230,6 +236,9 @@ public final class MonitorService extends Service {
         OverlayMonitor overlay = overlayMonitor;
         overlayMonitor = null;
         if (overlay != null) overlay.close();
+        OemProcessMonitor oem = oemProcessMonitor;
+        oemProcessMonitor = null;
+        if (oem != null) oem.close();
         GpuExecMonitor exec = gpuExecMonitor;
         gpuExecMonitor = null;
         if (exec != null) exec.close();

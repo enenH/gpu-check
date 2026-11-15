@@ -1131,6 +1131,14 @@ int main(int argc, char** argv) {
         out << ",\"cgroupScan\":"; cgroupScan.json(out);
         out << ",\"processEvents\":";
         processEvents.json(out);
+        out << ",\"cpuExcludedPidTids\":[";
+        bool firstExcludedPid = true;
+        for (int pid : excluded) {
+            if (!firstExcludedPid) out << ',';
+            firstExcludedPid = false;
+            out << pid;
+        }
+        out << ']';
         out << ",\"cpuSamples\":";
         cpuSignals.json(out);
         out << ",\"globalGpu\":";
