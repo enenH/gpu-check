@@ -43,6 +43,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
     private final JSONArray issues = new JSONArray();
     private final Set<String> issueKeys = new HashSet<>();
     private final Set<String> recorded = new HashSet<>();
+    private final Set<String> recordedSnapshots = new HashSet<>();
     private Bundle arguments;
     private MainActivity activity;
     private BufferedWriter reports;
@@ -56,6 +57,14 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
     private int expectedTargetObservations;
     private int nonemptyUiSnapshots;
     private int maximumUiCandidates;
+    private int gpuExecReports;
+    private int gpuExecActiveReports;
+    private int gpuFrequencyReports;
+    private int gpuFrequencyAlertReports;
+    private int gpuFrequencyVisibleFrames;
+    private boolean gpuFrequencyClearedAfterAlert;
+    private long gpuFrequencyFirstAlertAt, gpuFrequencyFirstClearAt;
+    private android.content.ServiceConnection gpuFixture;
     private String installedVersion;
     private View overlayFixture;
     private String overlayFixtureName;
@@ -90,6 +99,16 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                 if (statusLine.startsWith("CapEff:")) summary.put("appCapEff", statusLine.substring(7).trim());
             }
             check(android.os.Process.myUid() >= 10000, "Instrumentation must run as an ordinary App UID");
+            if (Boolean.parseBoolean(arguments.getString("gpu_exec_only", "false"))) {
+                JSONObject exec = new JSONObject();
+                summary.put("test", "gpu_exec_native_device").put("gpuExec", exec);
+                GpuExecInstrumentation.verify(getTargetContext(), exec);
+                summary.put("result", "PASS"); result.putString("result", "PASS");
+                resultCode = Activity.RESULT_OK;
+                return;
+            }
+            summary.put("gpuExecModelRegression", GpuExecChecks.models());
+            summary.put("gpuFrequencyModelRegression", GpuFrequencyChecks.models());
             summary.put("kernelThreadRegression", KernelThreadChecks.engine());
             if (Boolean.parseBoolean(arguments.getString("kernel_checks_only", "false"))) {
                 summary.put("test", "kernel_thread_headless").put("kernelThreadCollector", KernelThreadChecks.collector(getTargetContext()));
@@ -123,6 +142,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             ready.putInt("rootProcessCount", first.optInt("rootProcessCount"));
             ready.putInt("cgroupAnomalyCount", first.optInt("cgroupAnomalyCount"));
             sendStatus(0, ready);
+            if (Boolean.parseBoolean(arguments.getString("gpu_exec_fixture", "false"))) bindGpuFixture();
             long deadline = SystemClock.elapsedRealtime() + durationSeconds * 1000L;
             while (SystemClock.elapsedRealtime() < deadline) {
                 check(MonitorService.running, "Service stopped during real capture: " + MonitorService.lastError);
@@ -131,6 +151,21 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                 SystemClock.sleep(50);
             }
             recordLatest("first");
+            if (Boolean.parseBoolean(arguments.getString("require_gpu_exec", "false"))) {
+                check(gpuExecReports > 0, "No native gpuexec_multi result reached the Service/UI pipeline");
+            }
+            if (Boolean.parseBoolean(arguments.getString("require_gpu_frequency", "false"))) {
+                check(gpuFrequencyReports > 0, "No complete GPU frequency result reached the Service/UI pipeline");
+            }
+            if (Boolean.parseBoolean(arguments.getString("require_gpu_frequency_alert", "false"))
+                    || Boolean.parseBoolean(arguments.getString("require_gpu_frequency_cycle", "false"))) {
+                check(gpuFrequencyAlertReports > 0 && gpuFrequencyVisibleFrames > 0,
+                        "No sustained GPU frequency warning reached both report and real red UI");
+            }
+            if (Boolean.parseBoolean(arguments.getString("require_gpu_frequency_cycle", "false"))) {
+                check(gpuFrequencyClearedAfterAlert, "GPU frequency warning did not clear on a later real no-alert sample");
+            }
+            if (gpuFixture != null) check(gpuExecActiveReports > 0, "Independent EGL workload produced no visible multi-slot observations");
             if (overlayFixtureName != null) {
                 check(fixtureHitAt > 0, "Real ZUI collection did not find the app-owned fixture window");
                 check(fixtureGoneObserved, "A fresh ZUI collection did not confirm fixture disappearance");
@@ -184,6 +219,10 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             result.putString("result", "FAIL");
             result.putString("error", detail);
         } finally {
+            if (gpuFixture != null) {
+                try { getTargetContext().unbindService(gpuFixture); } catch (Exception ignored) { }
+                gpuFixture = null;
+            }
             try { removeOverlayFixture(); } catch (Exception ignored) { }
             if (MonitorService.running) {
                 try { getTargetContext().stopService(new Intent(getTargetContext(), MonitorService.class)); }
@@ -193,6 +232,15 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             try { if (uiReports != null) uiReports.close(); } catch (Exception ignored) { }
             try {
                 summary.put("frames", frames).put("validationIssues", issues)
+                        .put("gpuExecCompleteReports", gpuExecReports)
+                        .put("gpuExecActiveReports", gpuExecActiveReports)
+                        .put("gpuFrequencyCompleteReports", gpuFrequencyReports)
+                        .put("gpuFrequencyAlertReports", gpuFrequencyAlertReports)
+                        .put("gpuFrequencyVisibleFrames", gpuFrequencyVisibleFrames)
+                        .put("gpuFrequencyClearedAfterAlert", gpuFrequencyClearedAfterAlert)
+                        .put("gpuFrequencyFirstAlertAtUptimeMs", gpuFrequencyFirstAlertAt)
+                        .put("gpuFrequencyFirstClearAtUptimeMs", gpuFrequencyFirstClearAt)
+                        .put("recordedSnapshots", recordedSnapshots.size())
                         .put("realSamples", recorded.size()).put("expectedTargetObservations", expectedTargetObservations)
                         .put("startingSnapshotObserved", startingObserved).put("startingUiObserved", startingUiObserved)
                         .put("nonemptyUiSnapshots", nonemptyUiSnapshots).put("maximumUiCandidates", maximumUiCandidates)
@@ -269,7 +317,12 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             return null;
         }
         String key = report.getInt("collectorPid") + ":" + report.getLong("sampleIndex");
-        if (!recorded.add(key)) return null;
+        JSONObject frequency = report.optJSONObject("globalGpu") == null ? null
+                : report.getJSONObject("globalGpu").optJSONObject("slotFrequency");
+        String snapshotKey = key + ":" + (frequency == null ? "missing" : frequency.optLong("sampledAtUptimeMs", -1)
+                + ":" + frequency.optString("status") + ":" + frequency.optBoolean("alert"));
+        if (!recordedSnapshots.add(snapshotKey)) return null;
+        recorded.add(key);
         reports.write(raw);
         reports.newLine();
         reports.flush();
@@ -277,6 +330,14 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
                 "Real collector did not retain the ordinary App UID");
         check("direct_logdr_seqpacket_self_uid".equals(report.optString("avcTransport")), "Real AVC enrichment was bypassed");
         JSONObject global = report.optJSONObject("globalGpu");
+        if (GpuFrequencyChecks.real(report)) gpuFrequencyReports++;
+        if (frequency != null && frequency.optBoolean("alert")) gpuFrequencyAlertReports++;
+        if (GpuExecChecks.real(report)) gpuExecReports++;
+        JSONArray execRows = global.getJSONObject("execMulti").optJSONArray("slots");
+        for (int i = 0; execRows != null && i < execRows.length(); i++) {
+            JSONObject row = execRows.getJSONObject(i);
+            if (row.optBoolean("eligible") && row.optInt("completedSamples") > 0) { gpuExecActiveReports++; break; }
+        }
         JSONObject ownSlots = global == null ? null : global.optJSONObject("selfGpuSlots");
         check(ownSlots != null && ownSlots.optInt("pid") == android.os.Process.myPid()
                 && ownSlots.optInt("uid") == android.os.Process.myUid(), "Real App GPU-owner enrichment was bypassed");
@@ -312,6 +373,7 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             }
         }
         JSONObject ui = captureUi();
+        observeGpuFrequency(ui, phase);
         ui.put("phase", phase).put("capturedReportSampleIndex", report.getLong("sampleIndex"))
                 .put("capturedReportCollectorPid", report.getInt("collectorPid"))
                 .put("renderedMatchesReport", ui.optLong("sampleIndex", -1) == report.getLong("sampleIndex")
@@ -322,6 +384,30 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         frame.put("ui", ui);
         frames.put(frame);
         return report;
+    }
+
+    private void observeGpuFrequency(JSONObject ui, String phase) throws Exception {
+        if (!"first".equals(phase)) return;
+        JSONObject actual = ui.getJSONObject("gpuFrequency");
+        if (actual.optBoolean("visible")) {
+            gpuFrequencyVisibleFrames++;
+            if (gpuFrequencyFirstAlertAt == 0) {
+                gpuFrequencyFirstAlertAt = actual.getLong("capturedAtUptimeMs");
+                summary.put("gpuFrequencyFirstAlertUi", new JSONObject(actual.toString()));
+                screenshot("gpu-frequency-alert.png");
+                Bundle status = new Bundle(); status.putString("stage", "GPU_FREQUENCY_ALERT_DETECTED"); sendStatus(0, status);
+            }
+        } else if (gpuFrequencyFirstAlertAt > 0 && !gpuFrequencyClearedAfterAlert) {
+            JSONObject measured = actual.optJSONObject("result");
+            if (measured != null && "complete".equals(measured.optString("status")) && !measured.optBoolean("alert")
+                    && measured.optLong("sampledAtUptimeMs") > gpuFrequencyFirstAlertAt) {
+                gpuFrequencyClearedAfterAlert = true;
+                gpuFrequencyFirstClearAt = actual.getLong("capturedAtUptimeMs");
+                summary.put("gpuFrequencyFirstClearUi", new JSONObject(actual.toString()));
+                screenshot("gpu-frequency-cleared.png");
+                Bundle status = new Bundle(); status.putString("stage", "GPU_FREQUENCY_ALERT_CLEARED"); sendStatus(0, status);
+            }
+        }
     }
 
     /** A real app-owned panel, not mock detector input; no SYSTEM_ALERT_WINDOW permission. */
@@ -418,6 +504,18 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         return pids;
     }
 
+    private void bindGpuFixture() throws Exception {
+        java.util.concurrent.CountDownLatch connected = new java.util.concurrent.CountDownLatch(1);
+        gpuFixture = new android.content.ServiceConnection() {
+            @Override public void onServiceConnected(android.content.ComponentName name, android.os.IBinder service) { connected.countDown(); }
+            @Override public void onServiceDisconnected(android.content.ComponentName name) { }
+        };
+        Intent intent = new Intent().setComponent(new android.content.ComponentName("com.gpucheck.app.test", "com.gpucheck.app.GpuExecFixtureService"));
+        check(getTargetContext().bindService(intent, gpuFixture, android.content.Context.BIND_AUTO_CREATE), "cannot bind independent EGL fixture");
+        check(connected.await(5, java.util.concurrent.TimeUnit.SECONDS), "independent EGL fixture did not connect");
+        summary.put("gpuFixture", "independent_test_apk_uid_real_egl_no_slot_or_pid_input");
+    }
+
     private JSONObject captureUi() throws Exception {
         AtomicReference<JSONObject> result = new AtomicReference<>();
         onMain(() -> {
@@ -453,11 +551,17 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
             if (suspected) validation(overlayLabel.getCurrentTextColor() == android.graphics.Color.rgb(255, 119, 125)
                             && overlayNames.getVisibility() == View.VISIBLE && overlayNames.length() > 0,
                     "overlay_red", "Overlay alert is not red or lacks names");
+            JSONObject gpuFrequency = GpuFrequencyChecks.ui(shown, (TextView) field("gpuFrequencyWarning"),
+                    (Long) field("gpuFrequencyReceivedAtMs"), MonitorService.running
+                            && (Boolean) field("refreshActive") && !(Boolean) field("monitorStopRequested"));
             result.set(new JSONObject().put("renderedReportPresent", shown != null)
                     .put("hasRealSample", shown != null && shown.has("sampleIndex"))
                     .put("sampleIndex", shown == null ? -1 : shown.optLong("sampleIndex", -1))
                     .put("collectorPid", shown == null ? -1 : shown.optInt("collectorPid", -1))
                     .put("heroStatus", ((TextView) field("heroStatus")).getText().toString())
+                    .put("gpuExecStatus", ((TextView) field("gpuExecStatus")).getText().toString())
+                    .put("gpuExecRows", ((TextView) field("gpuExecRows")).getText().toString())
+                    .put("gpuFrequency", gpuFrequency)
                     .put("overlayStatus", overlayLabel.getText().toString()).put("overlayColor", overlayLabel.getCurrentTextColor())
                     .put("overlayNames", overlayNames.getText().toString()).put("overlaySuspected", suspected)
                     .put("button", ((Button) field("startButton")).getText().toString())
@@ -478,8 +582,12 @@ public final class ServiceDeviceInstrumentation extends Instrumentation {
         check(!processExists(collectorPid), key + ": native collector remained alive");
         SystemClock.sleep(1200);
         check(!MonitorService.running && MonitorService.latestReport == null, key + ": old worker republished after stop");
+        GpuExecChecks.noWorkers();
+        JSONObject stoppedUi = captureUi();
+        check(!stoppedUi.getJSONObject("gpuFrequency").getBoolean("visible"), key + ": GPU frequency warning remained after stop");
         summary.put(key, new JSONObject().put("running", MonitorService.running)
-                .put("reportCleared", MonitorService.latestReport == null).put("collectorExited", true));
+                .put("reportCleared", MonitorService.latestReport == null).put("collectorExited", true)
+                .put("gpuFrequencyWarningCleared", true));
     }
 
     private static boolean processExists(int pid) throws Exception {

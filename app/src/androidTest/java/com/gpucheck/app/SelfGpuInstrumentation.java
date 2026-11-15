@@ -149,7 +149,7 @@ public final class SelfGpuInstrumentation extends Instrumentation {
         if (!condition) throw new AssertionError(message);
     }
 
-    private static final class EglWorkload extends Thread {
+    static final class EglWorkload extends Thread {
         final CountDownLatch ready = new CountDownLatch(1);
         volatile boolean running = true;
         volatile Throwable error;

@@ -18,6 +18,8 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** User-started monitor; the native helper loses stdin when the app dies. */
 public final class MonitorService extends Service {
@@ -30,9 +32,13 @@ public final class MonitorService extends Service {
     private static final Object REPORT_LOCK = new Object();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService frequencyPublisher = Executors.newSingleThreadExecutor(
+            task -> new Thread(task, "gpu-frequency-publisher"));
+    private final AtomicBoolean frequencyPublishQueued = new AtomicBoolean();
     private volatile Process process;
     private volatile AvcEvidence avcEvidence;
     private volatile OverlayMonitor overlayMonitor;
+    private volatile GpuExecMonitor gpuExecMonitor;
     private volatile int generation;
     private volatile long lastOutputAt;
     private volatile boolean receivedSample;
@@ -80,6 +86,7 @@ public final class MonitorService extends Service {
         final double configuredThreshold = threshold;
         OverlayMonitor sessionOverlay = new OverlayMonitor(this);
         overlayMonitor = sessionOverlay;
+        gpuExecMonitor = new GpuExecMonitor(() -> queueFrequencyPublication(token));
         try {
             JSONObject initial = new JSONObject();
             initial.put("schema", 1).put("root", false).put("mode", "unprivileged")
@@ -150,6 +157,8 @@ public final class MonitorService extends Service {
                     SelfGpuSlots.enrich(raw);
                     localEvidence.enrich(raw);
                     JSONObject report = engine.process(raw);
+                    GpuExecMonitor exec = gpuExecMonitor;
+                    if (exec != null && token == generation) exec.enrich(report);
                     OverlayMonitor overlay = overlayMonitor;
                     if (overlay != null && token == generation) report.put("overlay", overlay.snapshot());
                     publish(report, token);
@@ -175,10 +184,36 @@ public final class MonitorService extends Service {
     private void publish(JSONObject report, int token) throws Exception {
         synchronized (REPORT_LOCK) {
         if (token != generation || !running) return;
+        GpuExecMonitor exec = gpuExecMonitor;
+        JSONObject global = report.optJSONObject("globalGpu");
+        if (exec != null && global != null) global.put("slotFrequency", exec.frequencySnapshot());
         report.put("monitoring", true).put("deviceModel", Build.MANUFACTURER + " " + Build.MODEL)
                 .put("androidVersion", Build.VERSION.RELEASE).put("appVersion", appVersion)
                 .put("samplingState", report.has("sampleIndex") ? "SAMPLING" : "STARTING");
         latestReport = report.toString();
+        }
+    }
+
+    private void queueFrequencyPublication(int token) {
+        if (token != generation || !running || !frequencyPublishQueued.compareAndSet(false, true)) return;
+        try {
+            frequencyPublisher.execute(() -> {
+                try { publishFrequency(token); }
+                finally { frequencyPublishQueued.set(false); }
+            });
+        } catch (RejectedExecutionException stopped) { frequencyPublishQueued.set(false); }
+    }
+
+    private void publishFrequency(int token) {
+        synchronized (REPORT_LOCK) {
+            if (token != generation || !running || latestReport == null || gpuExecMonitor == null) return;
+            try {
+                JSONObject report = new JSONObject(latestReport);
+                JSONObject global = report.optJSONObject("globalGpu");
+                if (global == null) return;
+                global.put("slotFrequency", gpuExecMonitor.frequencySnapshot());
+                latestReport = report.toString();
+            } catch (Exception error) { Log.w("GpuCheck", "Frequency snapshot", error); }
         }
     }
 
@@ -195,6 +230,9 @@ public final class MonitorService extends Service {
         OverlayMonitor overlay = overlayMonitor;
         overlayMonitor = null;
         if (overlay != null) overlay.close();
+        GpuExecMonitor exec = gpuExecMonitor;
+        gpuExecMonitor = null;
+        if (exec != null) exec.close();
         latestReport = null;
         lastError = error == null ? null : status + "\n" + error;
         stopSelf();
@@ -212,6 +250,7 @@ public final class MonitorService extends Service {
         if (running) stopMonitoring("检测已结束", null);
         handler.removeCallbacksAndMessages(null);
         worker.shutdownNow();
+        frequencyPublisher.shutdownNow();
         super.onDestroy();
     }
 

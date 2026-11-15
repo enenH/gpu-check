@@ -75,6 +75,23 @@ Manifest 不声明任何权限；不申请通知、存储或读取全设备日�
    原始报告的overlay.routes保留实际响应状态、查询证据、范围及时间；接口缺失、拒绝、畸形回复、超时和未发现名称分别记录。
    子串枚举与文本解析均有覆盖范围限制；其他路线不可用时不会显示“安全”或当作已扫描全部图层。
 
+9. GPU 多槽短窗口采样（gpuexec_multi）：在独立工作线程中，相邻轮次至少间隔5秒，每轮最多选16个活动用户槽并行观察，默认30个样本、共同最多500毫秒窗口。
+   沿用原方法的40字节KGSL槽布局、+0/+8计数、50微秒轮询、5毫秒观察间隔及50毫秒单样本完成期限；起始提交计数不足100时记录不活跃。
+   当前支持槽号1至255，并进一步排除布局尾部7个保留槽；超过16个候选按槽号游标轮换，报告未覆盖的范围和数量。
+   自身槽过滤有效才启动；排除当前/上一轮自身槽，采样结束再次查询自身所有权。查询不完整、重置/回绕及当前失效槽不展示为可用结果。
+   单槽分别记录完成、零等待、超时和窗口结束未完成；均值/最小/最大仅计算完成且非零的观察等待，缺失值保持未知。
+   这是CPU观察提交/完成计数的等待间隔，包含轮询和调度开销，不是GPU硬件执行耗时。观察次数/秒速率不是实测FPS，也不提供PID归属或新增风险判定。
+   界面显示各槽样本和非零等待均值，可点开查看全部槽；结果15秒过期，失效槽的旧结果不会在后续快照复活。停止或离开界面取消采样并清空。CPU采集无需等待该窗口完成。
+   独立native接口验证1至1024样本、100至10000毫秒窗口和最多16个不重复槽；App固定使用上述默认值。此实现输出本项目JSON，未实现原载荷GEXM远程传输协议。
+
+10. 后台悬浮窗频率提示：在检测会话内用独立单线程连续观察全部KGSL用户槽（槽0及尾部7个保留槽除外），每1毫秒轮询，完整500毫秒为一个判断窗口。
+   统计SOP开始处理标记发生变化的次数，不使用标记的数值增量；每个槽独立累计，严格超过90次/秒且有效测量时长达到3秒才显示红字“疑似后台悬浮窗 · 约 XX.X FPS”。
+   每个窗口前后重新确认自身槽，并排除当前/上次成功查询及CPU报告确认的自身槽；查询不完整、窗口间隔超过100毫秒、轮询中断超过50毫秒、计数重置/回绕、低于或等于90均重建连续状态。
+   自身查询之间串行，诊断短窗口与频率采样共享可取消会话。频率结果每约500毫秒独立刷新，不依赖CPU报告的2秒间隔；界面每250毫秒更新，结果超过1.5秒未更新则清除。
+   停止、重新开始、离开检测界面均清空提示及连续状态。此处“后台”描述其他GPU上下文活动，本应用的前后台采样生命周期不变。
+   FPS是GPU槽变化节奏的估算，一个显示帧可能对应多个命令批次；不是SurfaceFlinger呈现帧率，不提供PID归属，不单独证明悬浮窗或外挂。点击红字可查看槽号、持续时间及依据。
+   报告位于globalGpu.slotFrequency，保留原始变化次数、频率、窗口时刻、有效性及前后自身槽证据；不合并其他槽速率，不增加进程高风险数量。
+
 界面
 开始/停止检测；查看全进程CPU排行和进程详情。风险规则使用内部默认阈值，CPU监听本身不设最低负载。
 持续采样所有可发现的外部进程，排除自身后最多显示10个，统一按CPU从高到低排列，同CPU按PID升序，未知CPU置末。
@@ -150,6 +167,36 @@ cgroup路径候选真机回归（仅测试APK包含模拟数据）
 EGL 负载和检测器在测试结束时清理；负载代码仅在独立测试 APK 中，正式 APK 不包含。
 2026-10-28：10轮完整查询，识别2个自身槽，单轮最长3ms，自身高频5轮被排除，模拟外部对照5轮命中。
 记录：build\self-gpu-device-test\result.txt。
+
+GPU槽频率悬浮窗提示（2026-11-15，1.6.1）
+一加CPH2415、普通UID10056/untrusted_app/CapEff=0：实际运行dfm_plus -t --game dfm，检测器未接收目标PID或槽号。
+最终45秒验收通过：26份CPU快照、105份完整频率结果、48份实际红字界面记录，0验证问题；覆盖811个用户槽，活动槽估算约120 FPS。
+严格超过90次/秒并累计至少3秒完整有效窗口后显示；真实目标退出后清除，停止、重新开始、切后台及采样线程清理通过。
+报告发布采用独立合并任务，避免整机报告序列化阻断连续采样；原生仍扫描全部用户槽，仅省略确认空闲的JSON行。
+自身槽查询遇到文件句柄关闭竞争时最多重试3次，仅接受完整扫描，保留各次已确认的自身槽和重试证据。
+319项主机检查、10项频率协调器状态检查、Debug/Release构建和Lint通过（0错误、5项原有警告）。
+记录：build\slot-frequency-device-test\verified；安装包：dist\GpuCheck.apk。
+复现：先按下方参数构建并安装正式及测试APK；用NDK编译tests/device/gpu_overlay_guard.cpp，再执行
+    python scripts/test-slot-frequency-device.py --serial 830dcfd7 --guard GUARD_BINARY --duration 45
+此脚本启动本次唯一命名的真实DFM目标，按可执行文件身份及held-pidfd清理；测试代码不包含在正式APK。
+主机测试：scripts/test-slot-frequency.ps1及scripts/test-gpu-exec.ps1。FPS仍为槽变化节奏估算，不是呈现帧率或PID归属证据。
+
+GPU多槽短窗口采样（2026-11-15，1.6.0）
+一加CPH2415真机：普通UID10056、untrusted_app、CapEff=0；新增功能不需要清单权限。
+两个真实EGL槽进行3轮并行采样，每槽每轮30个完成样本；16槽并发、11组参数/布局拒绝、取消后重启和线程清理通过，实测取消收尾3毫秒。
+另用独立测试APK UID的真实EGL负载验证完整Service/UI：16份真实采样、12份带多槽结果、9份显示有效活动，0验证问题。
+正式检测器未接收测试负载的PID或槽号；测试负载、启动代码及模拟输入仅在测试APK中。
+12项C++边界断言、8项明确标记的缓存失效/过期/停止模型检查及既有8组主机回归通过；Debug/Release构建和Lint通过（0错误，5项原有警告）。
+验证记录：build\gpuexec-multi-test\native-device.json、service-device-final.json、service-real.jsonl、service-ui-active.png。
+主机边界测试：.\scripts\test-gpu-exec.ps1
+真机测试构建（本机使用NDK 30.0.14904198及JDK21；其他安装可通过参数选择）：
+    .\gradlew.bat assembleDebug assembleDebugAndroidTest lintDebug '-PgpuCheckNdkVersion=30.0.14904198' '-PgpuCheckTestRunner=com.gpucheck.app.ServiceDeviceInstrumentation' --no-daemon
+    adb -s SERIAL install -r app\build\outputs\apk\debug\app-debug.apk
+    adb -s SERIAL install -r app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk
+    adb -s SERIAL shell am instrument -w -r -e gpu_exec_only true com.gpucheck.app.test/com.gpucheck.app.ServiceDeviceInstrumentation
+    adb -s SERIAL shell am instrument -w -r -e duration_seconds 25 -e require_gpu_exec true -e gpu_exec_fixture true com.gpucheck.app.test/com.gpucheck.app.ServiceDeviceInstrumentation
+两种测试依次写入App私有files/service-device-summary.json，运行下一种之前先取回；完整界面测试还保存service-real.jsonl和截图。
+测试结束卸载com.gpucheck.app.test，解除独立EGL负载；正式App保留。APK位于dist\GpuCheck.apk。
 
 VRI前缀统一过滤（2026-11-13，1.5.4）
 按用户要求将所有VRI-开头的名称从悬浮窗告警中过滤，保留原始名称及明确过滤原因；不再限定完整组件格式。

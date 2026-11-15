@@ -10,6 +10,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
@@ -59,6 +60,9 @@ public final class MainActivity extends Activity {
     private TextView watchSummary;
     private TextView permissionStatus;
     private TextView globalGpuStatus;
+    private TextView gpuExecStatus;
+    private TextView gpuExecRows;
+    private TextView gpuFrequencyWarning;
     private TextView environmentSummary;
     private TextView recentLifecycleSignals;
     private TextView overlayStatus;
@@ -79,13 +83,15 @@ public final class MainActivity extends Activity {
     private boolean lastRenderedRunning;
     private boolean forceRefresh = true;
     private JSONObject currentReport;
+    private long gpuFrequencyReceivedAtMs;
+    private boolean monitorStopRequested;
 
     private final Handler refreshHandler = new Handler(Looper.getMainLooper());
     private final Runnable refreshLoop = new Runnable() {
         @Override public void run() {
             if (!refreshActive) return;
             renderLatest();
-            refreshHandler.postDelayed(this, 1000);
+            refreshHandler.postDelayed(this, 250);
         }
     };
 
@@ -110,6 +116,7 @@ public final class MainActivity extends Activity {
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         refreshActive = false;
         refreshHandler.removeCallbacks(refreshLoop);
+        clearGpuFrequencyWarning();
         super.onPause();
     }
 
@@ -122,6 +129,8 @@ public final class MainActivity extends Activity {
             lastRenderedSnapshot = null;
             clearProcessRows();
             updateOverlayStatus();
+            updateGpuExecStatus();
+            updateGpuFrequencyStatus();
         }
         super.onStop();
     }
@@ -171,6 +180,15 @@ public final class MainActivity extends Activity {
         overlayCard.setOnClickListener(v -> showOverlayEvidence());
         overlayCard.setFocusable(true);
         marginAdd(page, overlayCard, 16);
+
+        gpuFrequencyWarning = label("", 18, RED, true);
+        gpuFrequencyWarning.setLineSpacing(dp(3), 1f);
+        gpuFrequencyWarning.setPadding(dp(18), dp(14), dp(18), dp(14));
+        gpuFrequencyWarning.setBackground(shape(Color.rgb(43, 30, 35), RED, 16));
+        gpuFrequencyWarning.setVisibility(View.GONE);
+        gpuFrequencyWarning.setOnClickListener(v -> showGpuFrequencyEvidence());
+        gpuFrequencyWarning.setFocusable(true);
+        marginAdd(page, gpuFrequencyWarning, 12);
 
         hero = card();
         marginAdd(page, hero, 22);
@@ -237,6 +255,17 @@ public final class MainActivity extends Activity {
         errorText.setVisibility(View.GONE);
         marginAdd(page, errorText, 12);
 
+        LinearLayout execCard = card();
+        gpuExecStatus = label("GPU 多槽采样 · 等待开始", 16, TEXT, true);
+        gpuExecRows = label("", 12, MUTED, false);
+        gpuExecRows.setLineSpacing(dp(3), 1f);
+        execCard.addView(gpuExecStatus);
+        marginAdd(execCard, gpuExecRows, 6);
+        marginAdd(execCard, label("整机槽位观察 · 归属未知 · 点击查看详情", 11, MUTED, false), 6);
+        execCard.setOnClickListener(v -> showGpuExecEvidence());
+        execCard.setFocusable(true);
+        marginAdd(page, execCard, 14);
+
         LinearLayout sectionHeading = row();
         listTitle = label(getString(R.string.candidates_title), 18, TEXT, true);
         sectionHeading.addView(listTitle, new LinearLayout.LayoutParams(0, -2, 1));
@@ -253,6 +282,8 @@ public final class MainActivity extends Activity {
 
     private void toggleMonitor() {
         if (MonitorService.running) {
+            monitorStopRequested = true;
+            clearGpuFrequencyWarning();
             startService(new Intent(this, MonitorService.class).setAction(MonitorService.ACTION_STOP));
             startButton.setEnabled(false);
             startButton.postDelayed(() -> { startButton.setEnabled(true); renderLatest(); }, 500);
@@ -260,6 +291,7 @@ public final class MainActivity extends Activity {
         }
         Intent intent = new Intent(this, MonitorService.class).setAction(MonitorService.ACTION_START);
         try {
+            monitorStopRequested = false;
             startService(intent);
             startButton.setEnabled(false);
             startButton.postDelayed(() -> { startButton.setEnabled(true); renderLatest(); }, 800);
@@ -277,9 +309,12 @@ public final class MainActivity extends Activity {
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         String raw = MonitorService.latestReport;
         String currentError = MonitorService.lastError;
+        // The warning expires even when a stalled collector leaves the same report in memory.
+        updateGpuFrequencyStatus();
         if (!forceRefresh && running == lastRenderedRunning && Objects.equals(raw, lastRenderedSnapshot)
                 && Objects.equals(currentError, lastRenderedError)) return;
         forceRefresh = false;
+        if (!Objects.equals(raw, lastRenderedSnapshot)) gpuFrequencyReceivedAtMs = SystemClock.elapsedRealtime();
         lastRenderedRunning = running;
         lastRenderedSnapshot = raw;
         lastRenderedError = currentError;
@@ -294,6 +329,8 @@ public final class MainActivity extends Activity {
             updateOverlayStatus();
             updateEnvironmentStatus();
             updateRecentLifecycleSignals();
+            updateGpuExecStatus();
+            updateGpuFrequencyStatus();
             watchSummary.setText(getString(R.string.monitoring_summary, 0, 0, 0));
             candidateMetric.setText("—");
             gpuMetric.setText("—");
@@ -317,6 +354,8 @@ public final class MainActivity extends Activity {
             updateOverlayStatus();
             updateEnvironmentStatus();
             updateRecentLifecycleSignals();
+            updateGpuExecStatus();
+            updateGpuFrequencyStatus();
             if (running && isStartingReport()) {
                 watchSummary.setText(getString(R.string.monitoring_summary, 0, 0, 0));
                 permissionStatus.setText(getString(R.string.ordinary_mode, uidText(currentReport.optInt("collectorUid", -1))));
@@ -431,6 +470,8 @@ public final class MainActivity extends Activity {
             }
         } catch (JSONException e) {
             currentReport = null;
+            updateGpuExecStatus();
+            updateGpuFrequencyStatus();
             updateOverlayStatus();
             environmentCard.setVisibility(View.GONE);
             environmentSummary.setText("");
@@ -549,6 +590,145 @@ public final class MainActivity extends Activity {
     private boolean isStartingReport() {
         return currentReport != null && ("STARTING".equals(currentReport.optString("samplingState"))
                 || !currentReport.has("sampleIndex"));
+    }
+
+    private JSONObject gpuFrequencyResult() {
+        JSONObject global = currentReport == null ? null : currentReport.optJSONObject("globalGpu");
+        return global == null ? null : global.optJSONObject("slotFrequency");
+    }
+
+    private void clearGpuFrequencyWarning() {
+        if (gpuFrequencyWarning == null) return;
+        gpuFrequencyWarning.setVisibility(View.GONE);
+        gpuFrequencyWarning.setText("");
+    }
+
+    private void updateGpuFrequencyStatus() {
+        if (gpuFrequencyWarning == null) return;
+        JSONObject result = gpuFrequencyResult();
+        if (!refreshActive || !MonitorService.running || monitorStopRequested || result == null
+                || !"complete".equals(result.optString("status")) || !result.optBoolean("alert")) {
+            clearGpuFrequencyWarning();
+            return;
+        }
+        long ageMs = result.optLong("ageMs", -1);
+        long expiryMs = result.optLong("expiryMs", 1500);
+        long sinceReceipt = SystemClock.elapsedRealtime() - gpuFrequencyReceivedAtMs;
+        long sampledAt = result.optLong("sampledAtUptimeMs", 0);
+        long nowUptime = SystemClock.uptimeMillis();
+        double fps = result.optDouble("peakFps", Double.NaN);
+        if (ageMs < 0 || expiryMs <= 0 || sinceReceipt < 0 || ageMs > expiryMs
+                || sinceReceipt > expiryMs - ageMs || sampledAt > nowUptime
+                || (sampledAt > 0 && nowUptime - sampledAt > expiryMs)
+                || !Double.isFinite(fps) || fps <= 0) {
+            clearGpuFrequencyWarning();
+            return;
+        }
+        gpuFrequencyWarning.setText(getString(R.string.gpu_frequency_warning, fps));
+        gpuFrequencyWarning.setTextColor(RED);
+        gpuFrequencyWarning.setVisibility(View.VISIBLE);
+    }
+
+    private void showGpuFrequencyEvidence() {
+        JSONObject result = gpuFrequencyResult();
+        StringBuilder detail = new StringBuilder(getString(R.string.gpu_frequency_explanation));
+        if (result != null) {
+            JSONArray rows = result.optJSONArray("slots");
+            for (int i = 0; rows != null && i < rows.length(); i++) {
+                JSONObject row = rows.optJSONObject(i);
+                if (row == null || !row.optBoolean("eligible") || !row.optBoolean("alert")) continue;
+                double fps = row.optDouble("observationsPerSecond", Double.NaN);
+                if (!Double.isFinite(fps)) continue;
+                detail.append(String.format(Locale.getDefault(), "\n\n槽 %d · 约 %.1f FPS\n持续高于阈值 %.1f 秒",
+                        row.optInt("slot"), fps, row.optLong("stableForMs") / 1000.0));
+            }
+        }
+        TextView text = label(detail.toString(), 13, TEXT, false);
+        text.setTextIsSelectable(true);
+        text.setPadding(dp(20), dp(16), dp(20), dp(16));
+        text.setLineSpacing(dp(3), 1f);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(text);
+        new AlertDialog.Builder(this).setTitle(R.string.gpu_frequency_title).setView(scroll)
+                .setPositiveButton("关闭", null).show();
+    }
+
+    private JSONObject gpuExecResult() {
+        JSONObject global = currentReport == null ? null : currentReport.optJSONObject("globalGpu");
+        return global == null ? null : global.optJSONObject("execMulti");
+    }
+
+    private void updateGpuExecStatus() {
+        if (gpuExecStatus == null) return;
+        JSONObject result = gpuExecResult();
+        if (result == null) {
+            gpuExecStatus.setText(MonitorService.running ? "GPU 多槽采样 · 等待采样" : "GPU 多槽采样 · 等待开始");
+            gpuExecRows.setText(""); return;
+        }
+        JSONArray rows = result.optJSONArray("slots");
+        int observed = 0;
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; rows != null && i < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i);
+            if (row == null || !row.optBoolean("eligible") || row.optInt("measuredSamples") == 0) continue;
+            observed++;
+            if (observed <= 3) {
+                if (text.length() > 0) text.append('\n');
+                text.append(gpuExecRow(row));
+            }
+        }
+        if (observed > 0) {
+            gpuExecStatus.setText(getString(R.string.gpu_exec_observed, observed));
+            if (observed > 3) text.append("\n其余 ").append(observed - 3).append(" 个槽见详情");
+            text.append(String.format(Locale.getDefault(), "\n%.1f 秒前的观察", result.optLong("ageMs") / 1000.0));
+        } else {
+            String reason = result.optString("reason");
+            String state = result.optBoolean("sampling") ? "采样中"
+                    : "no_active_external_slots".equals(reason) ? "未观察到可采样的外部活动槽"
+                    : "waiting_self_filter".equals(reason) ? "等待自身槽确认"
+                    : "complete".equals(result.optString("status")) ? "本轮无可用完成样本" : "当前不可用";
+            gpuExecStatus.setText(getString(R.string.gpu_exec_state, state));
+        }
+        gpuExecRows.setText(text.toString());
+    }
+
+    private static String gpuExecRow(JSONObject row) {
+        String mean = row.isNull("meanWaitUs") ? "—"
+                : String.format(Locale.getDefault(), "%.1f μs", row.optDouble("meanWaitUs"));
+        return "槽 " + row.optInt("slot") + " · " + row.optInt("measuredSamples")
+                + " 次观察 · 非零均值 " + mean;
+    }
+
+    private void showGpuExecEvidence() {
+        JSONObject result = gpuExecResult();
+        StringBuilder detail = new StringBuilder("同时观察最多 16 个用户槽，每轮 500 毫秒。自身槽及保留槽不参与结果展示。\n"
+                + "等待时间是 CPU 观察提交、完成计数之间的间隔，包含轮询和调度开销。均值仅统计已完成的非零样本。观察次数不等于帧数，也不能据此确认进程归属或外挂。\n");
+        if (result != null) {
+            detail.append("\n本轮候选：").append(result.optInt("candidateCount"));
+            if (result.optBoolean("selectionTruncated")) detail.append("（分批轮换采样）");
+            if (result.optInt("activeOutsideRange") > 0) detail.append("\n超出当前支持槽号范围：").append(result.optInt("activeOutsideRange"));
+            JSONArray rows = result.optJSONArray("slots");
+            for (int i = 0; rows != null && i < rows.length(); i++) {
+                JSONObject row = rows.optJSONObject(i);
+                if (row == null) continue;
+                detail.append("\n\n");
+                if (!row.optBoolean("eligible")) {
+                    detail.append("槽 ").append(row.optInt("slot")).append(" · 结果不可用或已排除"); continue;
+                }
+                detail.append(gpuExecRow(row)).append("\n完成 ").append(row.optInt("completedSamples"))
+                        .append(" 次；超时 ").append(row.optInt("timedOutSamples"))
+                        .append(" 次；窗口结束未完成 ").append(row.optInt("unfinishedSamples")).append(" 次");
+                if (!row.isNull("minWaitUs")) detail.append("\n非零等待范围：").append(row.optInt("minWaitUs"))
+                        .append("–").append(row.optInt("maxWaitUs")).append(" μs");
+                detail.append(String.format(Locale.getDefault(), "\n观察速率：%.1f 次/秒", row.optDouble("observationsPerSecond")));
+            }
+            if (rows == null || rows.length() == 0) detail.append("\n\n尚无可用样本。");
+        } else detail.append("\n开始检测后自动采样，停止后清空。");
+        TextView text = label(detail.toString(), 13, TEXT, false);
+        text.setTextIsSelectable(true); text.setPadding(dp(20), dp(16), dp(20), dp(16));
+        text.setLineSpacing(dp(3), 1f);
+        ScrollView scroll = new ScrollView(this); scroll.addView(text);
+        new AlertDialog.Builder(this).setTitle("GPU 多槽采样").setView(scroll).setPositiveButton("关闭", null).show();
     }
 
     private void updateGlobalGpuStatus() {

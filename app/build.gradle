@@ -8,8 +8,8 @@ android {
         applicationId 'com.gpucheck.app'
         minSdk 26
         targetSdk 35
-        versionCode 16
-        versionName '1.5.4'
+        versionCode 18
+        versionName '1.6.1'
         testInstrumentationRunner project.findProperty('gpuCheckTestRunner') ?: 'com.gpucheck.app.SelfGpuInstrumentation'
         ndk { abiFilters 'arm64-v8a' }
     }
@@ -75,4 +75,22 @@ tasks.register('compileLayerBinder', Exec) {
     }
 }
 
-tasks.named('preBuild').configure { dependsOn 'compileProbe', 'compileSelfGpu', 'compileLayerBinder' }
+def execOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_exec.so')
+tasks.register('compileGpuExec', Exec) {
+    def source = rootProject.file('native/gpu_exec.cpp')
+    inputs.files(source, rootProject.file('native/gpu_exec_core.h'))
+    outputs.file(execOutput)
+    doFirst {
+        def output = execOutput.get().asFile
+        output.parentFile.mkdirs()
+        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
+        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
+        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+                '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
+                source.absolutePath, '-o', output.absolutePath
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn 'compileProbe', 'compileSelfGpu', 'compileLayerBinder', 'compileGpuExec' }

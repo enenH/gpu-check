@@ -40,4 +40,9 @@
     <string name="lifecycle_no_evidence">未观察到生命周期关联</string>
     <string name="lifecycle_exit_match">PID %1$d 退出后，槽 %2$s 停止推进（确认使用gpu悬浮窗）</string>
     <string name="lifecycle_exit_ambiguous">PID %1$d 退出前后存在同步变化，关联有歧义</string>
+    <string name="gpu_exec_observed">GPU 多槽采样 · %1$d 个槽</string>
+    <string name="gpu_exec_state">GPU 多槽采样 · %1$s</string>
+    <string name="gpu_frequency_warning">疑似后台悬浮窗 · 约 %1$.1f FPS</string>
+    <string name="gpu_frequency_title">GPU 频率提示依据</string>
+    <string name="gpu_frequency_explanation">排除自身槽后，同一 GPU 槽的观察频率持续高于 90 次/秒满 3 秒时提示；频率回落、采样失效或停止检测后清除。\n\nFPS 根据 GPU 开始处理标记的变化频率估算绘制节奏，标记数值的增量不作为帧数。该线索不能确定 PID、前后台归属，也不能单独证明存在悬浮窗。</string>
 </resources>

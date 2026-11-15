@@ -28,11 +28,34 @@ final class SelfGpuSlots {
         global.put("selfGpuSlots", query);
     }
 
-    static JSONObject inspect(int first, int end) throws JSONException {
+    static synchronized JSONObject inspect(int first, int end) throws JSONException {
         if (!NATIVE_LOADED) return unavailable("native_owner_query_unavailable");
         try {
-            String raw = nativeInspect(first, end);
-            return raw == null ? unavailable("native_owner_query_empty") : new JSONObject(raw);
+            long started = android.os.SystemClock.uptimeMillis();
+            int retriedRaces = 0;
+            long firstQueryNs = 0;
+            java.util.Set<Integer> confirmedSlots = new java.util.LinkedHashSet<>();
+            JSONArray priorAttempts = new JSONArray();
+            for (int attempt = 1; ; attempt++) {
+                String raw = nativeInspect(first, end);
+                JSONObject query = raw == null ? unavailable("native_owner_query_empty") : new JSONObject(raw);
+                long queryStarted = query.optLong("queryStartedMonotonicNs");
+                if (firstQueryNs == 0 && queryStarted > 0) firstQueryNs = queryStarted;
+                JSONArray own = query.optJSONArray("slots");
+                for (int i = 0; own != null && i < own.length(); i++) confirmedSlots.add(own.getInt(i));
+                query.put("attempts", attempt).put("retriedScanRaceCount", retriedRaces);
+                // A descriptor closed during enumeration is uncertainty, not a non-owner.
+                // Retry that transient race with a new complete scan; never accept a partial one.
+                if (query.optBoolean("complete") || attempt >= 3 || query.optInt("scanRaceCount") <= 0
+                        || query.optBoolean("timedOut") || query.optInt("queryErrorCount") > 0
+                        || android.os.SystemClock.uptimeMillis() - started >= 15) {
+                    if (attempt > 1) query.put("slots", new JSONArray(confirmedSlots))
+                            .put("queryStartedMonotonicNs", firstQueryNs).put("priorAttempts", priorAttempts);
+                    return query;
+                }
+                priorAttempts.put(new JSONObject(query.toString()));
+                retriedRaces += query.optInt("scanRaceCount");
+            }
         } catch (LinkageError | RuntimeException | JSONException error) {
             return unavailable("native_owner_query_failed");
         }
