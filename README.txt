@@ -115,8 +115,10 @@ CPU列表无固定数量截断；GPU生命周期观察仍仅针对root/cgroup异
 视觉系统、布局说明和UI回归命令见 docs/UI.md。
 
 构建
-JDK 17–23（推荐17或21）、Android SDK 35、默认NDK 29.0.13113456、Gradle 8.10.1。
-可通过 -PgpuCheckNdkVersion=已安装版本 指定本机构建使用的NDK。
+JDK推荐17或21（本机JDK 25也已验证）、Android SDK 35、Build Tools 36.0.0、默认NDK 29.0.13113456、AGP 9.5.1、Gradle 9.9.1。
+可在 local.properties 中设置 gpuCheckNdkVersion=已安装版本，或通过 -PgpuCheckNdkVersion=已安装版本 临时覆盖（命令行优先）。
+例如本机只安装了NDK 30.0.14904198时，添加 gpuCheckNdkVersion=30.0.14904198；local.properties 不提交到版本库，CI继续使用默认NDK。
+四个原生编译任务会跟踪NDK版本变化并重新编译；指定版本缺失时会报告编译器路径及配置方式。
 在 local.properties 配置 sdk.dir，运行：
     .\gradlew.bat assembleDebug lintDebug --no-daemon
 APK：app\build\outputs\apk\debug\app-debug.apk
@@ -125,7 +127,8 @@ APK：app\build\outputs\apk\debug\app-debug.apk
 GitHub Actions 自动构建与发布
 .github/workflows/build-release.yml 在每次分支或标签 push 后构建，也支持在 Actions 页面手动运行。
 删除分支或标签不构建；连续 push 不取消之前的构建。
-CI 使用 JDK 17、SDK 35、Build Tools 34.0.0、NDK 29.0.13113456 和仓库自带的 Gradle Wrapper。
+CI 使用 JDK 17、SDK 35、Build Tools 36.0.0、NDK 29.0.13113456 和仓库自带的 Gradle Wrapper。
+工作流通过 GPU_CHECK_NDK_VERSION 同时指定SDK安装包和Gradle的 gpuCheckNdkVersion，确保实际编译版本与已安装版本一致；本机NDK覆盖配置不会改变CI版本。
 执行 assembleDebug、assembleRelease、lintDebug；全部成功后直接发布到 GitHub Releases，不上传 Actions 构建物。
 每次运行使用独立的 build-运行ID-重跑次数 标签，指向本次构建的提交，并发布为预发布版本，避免并发或重跑覆盖附件。
 Release 附件：

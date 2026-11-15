@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
+    env:
+      # Use the same NDK for installation and Gradle, independent of local overrides.
+      GPU_CHECK_NDK_VERSION: '29.0.13113456'
+
     defaults:
       run:
         shell: bash
@@ -34,15 +38,18 @@ jobs:
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
       - name: Install Android build dependencies
-        # Keep these versions aligned with app/build.gradle and AGP 8.6.
+        # Keep these versions aligned with app/build.gradle and AGP 9.5.
         run: |
           sdkmanager --install --channel=3 \
             "platforms;android-35" \
-            "build-tools;34.0.0" \
-            "ndk;29.0.13113456"
+            "build-tools;36.0.0" \
+            "ndk;${GPU_CHECK_NDK_VERSION}"
 
       - name: Build APKs and run lint
-        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug :app:assembleRelease :app:lintDebug
+        run: >-
+          ./gradlew --no-daemon --stacktrace
+          "-PgpuCheckNdkVersion=${GPU_CHECK_NDK_VERSION}"
+          :app:assembleDebug :app:assembleRelease :app:lintDebug
 
       - name: Prepare release files
         run: |

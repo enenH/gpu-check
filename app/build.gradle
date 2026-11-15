@@ -1,9 +1,16 @@
 plugins { id 'com.android.application' }
 
+def localBuildProperties = new Properties()
+def localBuildPropertiesFile = rootProject.file('local.properties')
+if (localBuildPropertiesFile.isFile()) {
+    localBuildPropertiesFile.withInputStream { localBuildProperties.load(it) }
+}
+
 android {
     namespace 'com.gpucheck.app'
     compileSdk 35
-    ndkVersion project.findProperty('gpuCheckNdkVersion') ?: '29.0.13113456'
+    ndkVersion project.findProperty('gpuCheckNdkVersion') ?:
+            localBuildProperties.getProperty('gpuCheckNdkVersion') ?: '29.0.13113456'
     defaultConfig {
         applicationId 'com.gpucheck.app'
         minSdk 26
@@ -24,33 +31,43 @@ android {
     }
 }
 
+def sdkDirectory = androidComponents.sdkComponents.sdkDirectory
+def nativeCompiler = {
+    def ndk = new File(sdkDirectory.get().asFile, 'ndk/' + android.ndkVersion)
+    def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+    def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
+    def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+    if (!compiler.isFile()) {
+        throw new GradleException("Android NDK ${android.ndkVersion} compiler not found: ${compiler}. " +
+                'Install this NDK with SDK Manager, or set gpuCheckNdkVersion in local.properties ' +
+                '(or pass -PgpuCheckNdkVersion=<installed-version>).')
+    }
+    compiler
+}
+
 def probeOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_probe.so')
 tasks.register('compileProbe', Exec) {
     def source = rootProject.file('native/probe.cpp')
+    inputs.property('ndkVersion', android.ndkVersion)
     inputs.files(fileTree(rootProject.file('native')) { include '**/*.cpp', '**/*.h' })
     outputs.file(probeOutput)
     doFirst {
         def output = probeOutput.get().asFile
         output.parentFile.mkdirs()
-        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
-        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
-        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
-        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        def compiler = nativeCompiler()
         commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fPIE', '-pie', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined', source.absolutePath, '-o', output.absolutePath
     }
 }
 def selfGpuOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_self.so')
 tasks.register('compileSelfGpu', Exec) {
     def source = rootProject.file('native/self_gpu.cpp')
+    inputs.property('ndkVersion', android.ndkVersion)
     inputs.file(source)
     outputs.file(selfGpuOutput)
     doFirst {
         def output = selfGpuOutput.get().asFile
         output.parentFile.mkdirs()
-        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
-        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
-        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
-        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        def compiler = nativeCompiler()
         commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
                 source.absolutePath, '-o', output.absolutePath
@@ -60,15 +77,13 @@ tasks.register('compileSelfGpu', Exec) {
 def layerOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_layer.so')
 tasks.register('compileLayerBinder', Exec) {
     def source = rootProject.file('native/layer_binder.cpp')
+    inputs.property('ndkVersion', android.ndkVersion)
     inputs.file(source)
     outputs.file(layerOutput)
     doFirst {
         def output = layerOutput.get().asFile
         output.parentFile.mkdirs()
-        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
-        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
-        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
-        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        def compiler = nativeCompiler()
         commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
                 source.absolutePath, '-ldl', '-o', output.absolutePath
@@ -78,15 +93,13 @@ tasks.register('compileLayerBinder', Exec) {
 def execOutput = layout.buildDirectory.file('generated/probeJni/arm64-v8a/libgpu_exec.so')
 tasks.register('compileGpuExec', Exec) {
     def source = rootProject.file('native/gpu_exec.cpp')
+    inputs.property('ndkVersion', android.ndkVersion)
     inputs.files(source, rootProject.file('native/gpu_exec_core.h'))
     outputs.file(execOutput)
     doFirst {
         def output = execOutput.get().asFile
         output.parentFile.mkdirs()
-        def ndk = new File(android.sdkDirectory, 'ndk/' + android.ndkVersion)
-        def windows = System.getProperty('os.name').toLowerCase().contains('windows')
-        def host = windows ? 'windows-x86_64' : (System.getProperty('os.name').contains('Mac') ? 'darwin-x86_64' : 'linux-x86_64')
-        def compiler = new File(ndk, "toolchains/llvm/prebuilt/${host}/bin/clang++" + (windows ? '.exe' : ''))
+        def compiler = nativeCompiler()
         commandLine compiler.absolutePath, '--target=aarch64-linux-android26', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
                 '-fPIC', '-shared', '-static-libstdc++', '-Wl,-z,max-page-size=16384', '-Wl,--no-undefined',
                 source.absolutePath, '-o', output.absolutePath
