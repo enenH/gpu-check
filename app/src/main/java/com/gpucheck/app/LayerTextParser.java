@@ -14,6 +14,7 @@ final class LayerTextParser {
     static final class Row {
         final String name;
         int pid = -1, uid = -1;
+        boolean ownerConflict;
         Row(String name) { this.name = name; }
     }
 
@@ -26,13 +27,20 @@ final class LayerTextParser {
                 rows.putIfAbsent(match.group(2), new Row(match.group(2)));
         }
         // Only exact full names connect two records from the same dump. #N is never a PID.
+        // Duplicate full names may belong to different processes; a second, disagreeing owner
+        // claim leaves ownership unknown instead of letting the last line win.
         for (String line : lines) {
             Matcher match = TREE.matcher(line);
             if (!match.matches()) continue;
             Row row = rows.get(match.group(1));
-            if (row != null) {
-                try { row.pid = Integer.parseInt(match.group(2)); row.uid = Integer.parseInt(match.group(3)); }
-                catch (NumberFormatException ignored) { row.pid = -1; row.uid = -1; }
+            if (row == null || row.ownerConflict) continue;
+            int pid, uid;
+            // A malformed owner line makes no ownership claim at all.
+            try { pid = Integer.parseInt(match.group(2)); uid = Integer.parseInt(match.group(3)); }
+            catch (NumberFormatException ignored) { continue; }
+            if (row.pid < 0) { row.pid = pid; row.uid = uid; }
+            else if (row.pid != pid || row.uid != uid) {
+                row.pid = -1; row.uid = -1; row.ownerConflict = true;
             }
         }
         return new ArrayList<>(rows.values());
