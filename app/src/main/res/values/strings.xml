@@ -23,6 +23,7 @@
     <string name="monitored_candidates_description">排除本应用的进程与线程及已确认的内核线程，持续采样其余可发现进程，按 CPU 从高到低显示前 10 个；未知 CPU 排在末尾。</string>
     <string name="cgroup_check_unavailable">cgroup 路径探测校准不可用</string>
     <string name="cgroup_check_available">cgroup 路径探测可用</string>
+    <string name="cgroup_check_partial">cgroup 路径部分可用 · 本轮覆盖不足，暂不判定路径缺失</string>
     <string name="cgroup_anomaly_title">发现 cgroup 路径异常</string>
     <string name="cgroup_anomaly_description">已加入持续监听，继续观察 CPU 与 GPU 活动。</string>
     <string name="cgroup_anomaly_monitoring">cgroup路径未匹配 · 监听中</string>

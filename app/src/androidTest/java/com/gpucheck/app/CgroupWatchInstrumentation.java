@@ -395,6 +395,38 @@ public final class CgroupWatchInstrumentation extends Instrumentation {
         }
         check(output.getInt("cgroupAnomalyCount") == 1, "complete PID was discarded due to unrelated batch limits");
         controls.put(new JSONObject().put("case", "complete_pid_in_partial_batch").put("report", output));
+
+        // Partial layout availability and cached discovery are not complete current coverage,
+        // even if a malformed/older per-PID row claims all its paths were checked.
+        for (String unavailable : new String[]{"missingDetectionAvailable", "freshCoverageThisSample"}) {
+            engine = new RiskEngine(20, 3, 2000);
+            for (int sample = 0; sample < 3; sample++) {
+                JSONObject partial = frame(sample, row(ANOMALY_PID, -1, "held:partial-layout", 0, "MISSING", sample));
+                partial.getJSONObject("cgroupScan").put("complete", false).put("status", "partial")
+                        .put("missingDetectionAvailable", true).put("freshCoverageThisSample", true)
+                        .put(unavailable, false);
+                output = engine.process(partial);
+                check(output.getInt("cgroupAnomalyCount") == 0, "partial layout confirmed missing: " + unavailable);
+                check(output.getInt("monitoredProcessCount") == 1, "partial layout lost CPU monitoring");
+            }
+            controls.put(new JSONObject().put("case", "partial_scan_" + unavailable).put("report", output));
+
+            JSONObject present = frame(3, row(ANOMALY_PID, -1, "held:partial-layout", 0, "PRESENT", 3));
+            present.getJSONObject("cgroupScan").put("complete", false).put("status", "partial")
+                    .put("missingDetectionAvailable", false).put("freshCoverageThisSample", false);
+            output = engine.process(present);
+            check("PRESENT".equals(onlyProcess(output).getJSONObject("cgroupWatch").getString("status")),
+                    "partial layout discarded a calibrated positive observation");
+
+            for (int sample = 4; sample < 7; sample++) {
+                JSONObject complete = frame(sample, row(ANOMALY_PID, -1, "held:partial-layout", 0, "MISSING", sample));
+                complete.getJSONObject("cgroupScan").put("missingDetectionAvailable", true)
+                        .put("freshCoverageThisSample", true);
+                output = engine.process(complete);
+                check(output.getInt("cgroupAnomalyCount") == (sample == 6 ? 1 : 0),
+                        "complete coverage did not rebuild a three-sample streak");
+            }
+        }
     }
 
     private static JSONObject rootCpu(int pid, String identity, double cpu, long avcAge) throws Exception {

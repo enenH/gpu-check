@@ -58,6 +58,13 @@ final class RiskEngine {
                 && Boolean.TRUE.equals(cgroupScan.opt("available"))
                 && Boolean.TRUE.equals(cgroupScan.opt("calibrationValid"))
                 && cgroupScan.optLong("sampleIndex", -1) == sampleIndex;
+        // A usable layout can prove presence while other layouts or the current UID sweep
+        // remain incomplete. Never promote cached/partial coverage to a missing-path streak.
+        boolean cgroupMissingCoverage = cgroupPathMethodAvailable
+                && (!cgroupScan.has("missingDetectionAvailable")
+                    || Boolean.TRUE.equals(cgroupScan.opt("missingDetectionAvailable")))
+                && (!cgroupScan.has("freshCoverageThisSample")
+                    || Boolean.TRUE.equals(cgroupScan.opt("freshCoverageThisSample")));
         cgroupPolicy.beginSnapshot(sampleIndex, elapsed, cgroupPathMethodAvailable);
         JSONArray input = mergeCurrentCpuRows(report);
         JSONArray environmentChecks = report.optJSONArray("environmentChecks");
@@ -108,7 +115,7 @@ final class RiskEngine {
             String processIdentity = p.optString("identityToken", "");
             CgroupWatchPolicy.Decision cgroup = cgroupPolicy.evaluate(pid, processIdentity,
                     occurrences.get(pid) == 1 && Boolean.TRUE.equals(p.opt("identityVerified"))
-                            ? cgroupCheck(p.optJSONObject("cgroupCheck")) : null, isSelf);
+                            ? cgroupCheck(p.optJSONObject("cgroupCheck"), cgroupMissingCoverage) : null, isSelf);
             boolean rootCandidate = !isSelf && isRoot(p);
             p.put("cgroupAnomaly", cgroup.anomaly).put("cgroupWatch", cgroupWatchJson(cgroup))
                     .put("rootCandidate", rootCandidate).put("monitoredCandidate", true);
@@ -433,7 +440,7 @@ final class RiskEngine {
         return merged;
     }
 
-    private static CgroupWatchPolicy.Check cgroupCheck(JSONObject check) {
+    private static CgroupWatchPolicy.Check cgroupCheck(JSONObject check, boolean missingCoverage) {
         if (check == null) return null;
         for (String field : new String[]{"procPresent", "stableIdentity", "nonZombie", "pathCalibrationValid",
                 "pathCoverageComplete", "uidCoverageComplete", "pathFound"}) {
@@ -444,7 +451,8 @@ final class RiskEngine {
                 && Boolean.TRUE.equals(proc.opt("pidfdLiveAfter"));
         CgroupWatchPolicy.Paths paths = new CgroupWatchPolicy.Paths(
                 Boolean.TRUE.equals(check.opt("pathCalibrationValid")), Boolean.TRUE.equals(check.opt("pathCoverageComplete")),
-                Boolean.TRUE.equals(check.opt("uidCoverageComplete")), Boolean.TRUE.equals(check.opt("pathFound")),
+                missingCoverage && Boolean.TRUE.equals(check.opt("uidCoverageComplete")),
+                Boolean.TRUE.equals(check.opt("pathFound")),
                 check.optInt("testedUidCount", -1), check.optInt("testedPathCount", -1), check.optInt("missingPathCount", -1),
                 check.optLong("uidCatalogGeneration", -1), check.optString("coverageScope"));
         return new CgroupWatchPolicy.Check(check.optString("state"), Boolean.TRUE.equals(check.opt("procPresent")),

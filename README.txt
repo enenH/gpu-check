@@ -20,6 +20,10 @@ Manifest 不声明任何权限；不申请通知、存储或读取全设备日�
    不可读取的CPU和新进程基线显示未知，退出进程移除；报告保留本轮扫描是否完整与探测范围，不能发现的进程仍属于能力缺口。
    现有候选同时接收 cgroup 命名路径差异线索：使用 stat/fstatat 的返回值探测 /proc/PID 和参考 UID/PID 目录，不要求读取 cgroup 目录或成员文件。
    对现代 /sys/fs/cgroup/uid_N/pid_P 及旧式 apps/system 布局执行自身正对照和 uid_/pid_ 不存在对照，自主建立有界 UID 目录编目。
+   UID发现按布局轮转并保留续扫游标，慢设备下一轮继续未完成范围；历史目录只作为候选，使用前在本轮重新检查目录和正负对照。
+   一个布局或UID受限时保留其他已校准路径的存在证据；界面显示“部分可用”，不把整个通道关闭。
+   只有本轮重新完成所有候选布局的声明UID范围探测及前后校准，才允许确认路径未匹配；缓存未过期或跨轮遍历完成均不能代替本轮覆盖。
+   报告分别给出available/calibrationValid（局部可观察）、missingDetectionAvailable/freshCoverageThisSample（严格缺失判定能力），以及各布局和UID发现进度。
    返回0表示存在；经对照验证可区分不存在时，EACCES仅作为存在性线索；只有明确的ENOENT才计为路径未匹配。
    同一存活进程须有前后有效pidfd身份，本轮已校准范围内的所有候选路径均未匹配，连续3次才标记cgroup路径异常。
    这些进程沿用同一进程列表、CPU采样与GPU生命周期观察，零CPU也可准入；所有候选统一按CPU降序，未知CPU置末。
@@ -102,7 +106,7 @@ Manifest 不声明任何权限；不申请通知、存储或读取全设备日�
    厂商UID保存在reportedUid及来源字段，绝不替代原生有效uid或自动提升root/GPU风险；厂商CPU数值也不作为原生CPU百分比。
    oemProcesses保留每路线状态、覆盖范围、记录和时刻；Vivo/PerfShielder是候选查询，不能当作全量枚举。
 
-界面（1.8.0 信号指挥舱）
+界面（1.8.1 信号指挥舱）
 原生 Java / Android View 界面，深蓝黑背景、青柠操作色、冰蓝仪表和独立红色告警。
 在同一 Activity 内切换“总览 / 进程 / 证据”，切换页签不会停止采集；底部始终保留开始/停止按钮。
 总览突出高风险进程数、监听数量、GPU归属证据和最高CPU，并呈现图层、GPU活动及环境异常。
@@ -185,6 +189,12 @@ Release 附件：
 脚本保存窗口存在/消失时独立ADB SurfaceFlinger记录；当前ZUI禁用run-as，因此主机侧su仅用于取回测试回执和检查临时目录。
 App本身保持普通UID、untrusted_app、CapEff=0，无清单权限，不以这些外部记录参与检测。
 未开启overlay_fixture参数时，ServiceDeviceInstrumentation沿用普通Service/UI回归，不创建任何测试窗口。
+
+cgroup原生主机回归（模拟系统调用，不访问主机cgroup，无需Android设备）
+    python scripts/test-cgroup-native.py --sanitize
+使用C++17编译器执行正式Scanner流程，覆盖慢扫描续接、局部布局/UID受限、缓存与新目录、权限变化、末尾对照失效和完整覆盖恢复。
+这些模拟场景验证采集状态与证据边界，不代表任何ROM或真机已经通过验收；测试源码和产物不随正式APK发布。
+GitHub Actions在APK构建前运行原生回归及CgroupWatchPolicy规则回归，并编译Android测试APK。
 
 cgroup路径候选真机回归（仅测试APK包含模拟数据）
     .\gradlew.bat assembleDebug assembleDebugAndroidTest lintDebug '-PgpuCheckTestRunner=com.gpucheck.app.CgroupWatchInstrumentation' --no-daemon

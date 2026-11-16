@@ -92,6 +92,40 @@ inline int heldState(int fd) {
     if (rc > 0 && (p.revents & (POLLIN | POLLHUP))) return 1;
     return -1;
 }
+// Narrow syscall seam: production and deterministic host tests run the same scanner.
+struct Io {
+    uint64_t readDeadlineNs = UINT64_MAX;
+    virtual ~Io() = default;
+    virtual uint64_t timeNs() { return now(); }
+    virtual void setReadDeadline(uint64_t deadline) { readDeadlineNs = deadline; }
+    virtual int statDirectory(const std::string& path, struct stat& info) {
+        if (fstatat(AT_FDCWD, path.c_str(), &info, AT_SYMLINK_NOFOLLOW)) return errno;
+        return S_ISDIR(info.st_mode) ? 0 : ENOTDIR;
+    }
+    virtual bool readText(const std::string& path, std::string& out, size_t limit, int& error) {
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+        if (fd < 0) { error = errno; return false; }
+        bool ok = false; char buffer[4096];
+        for (;;) {
+            if (timeNs() >= readDeadlineNs) { error = EOVERFLOW; break; }
+            const size_t room = limit >= out.size() ? limit - out.size() : 0;
+            const ssize_t n = read(fd, buffer, std::min(sizeof(buffer), room + 1));
+            if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
+            if (!n) { ok = true; error = 0; break; }
+            if (size_t(n) > room) { error = EOVERFLOW; break; }
+            out.append(buffer, size_t(n));
+        }
+        close(fd); return ok;
+    }
+    virtual int pidfdState(int fd) { return heldState(fd); }
+    virtual bool isProcFs() {
+        struct statfs fs{};
+        return !statfs("/proc", &fs) && uint64_t(fs.f_type) == 0x9fa0;
+    }
+    virtual int uid() { return int(geteuid()); }
+    virtual int pid() { return int(getpid()); }
+    virtual int parentPid() { return int(getppid()); }
+};
 struct Check {
     std::string state = "UNKNOWN", identityToken, reason = "not_observed";
     bool procPresent = false, stableIdentity = false, nonZombie = false;
@@ -101,6 +135,8 @@ struct Check {
     size_t testedUidCount = 0, testedPathCount = 0, missingPathCount = 0;
     uint64_t uidCatalogGeneration = 0;
     unsigned sampleIndex = 0;
+    std::string observedLayout;
+    int observedUid = -1;
     std::vector<Probe> paths;
     void json(std::ostream& out) const {
         out << "{\"state\":" << quote(state) << ",\"procPresent\":" << procPresent
@@ -111,6 +147,7 @@ struct Check {
             << ",\"uidCoverageComplete\":" << uidCoverageComplete << ",\"pathFound\":" << pathFound
             << ",\"testedUidCount\":" << testedUidCount << ",\"testedPathCount\":" << testedPathCount
             << ",\"missingPathCount\":" << missingPathCount << ",\"uidCatalogGeneration\":" << uidCatalogGeneration
+            << ",\"observedLayout\":" << quote(observedLayout) << ",\"observedUid\":" << observedUid
             << ",\"coverageScope\":\"observed_uid_catalog\",\"procEvidence\":{\"method\":\"fstatat_and_held_pidfd\""
             << ",\"beforeErrno\":" << procBeforeErrno << ",\"afterErrno\":" << procAfterErrno
             << ",\"pidfdLiveBefore\":" << pidfdLiveBefore << ",\"pidfdLiveAfter\":" << pidfdLiveAfter
@@ -131,7 +168,7 @@ inline void evaluate(Check& check, const Life& before, const Life& after,
         check.state = "EXITED"; check.reason = "exit_or_zombie";
     } else if (!check.procPresent) check.reason = "proc_path_presence_unverified";
     else if (!check.stableIdentity) check.reason = "held_process_identity_unverified";
-    else if (check.pathFound) { check.state = "PRESENT"; check.reason = "calibrated_named_path_observed"; }
+    else if (check.pathFound && check.pathCalibrationValid) { check.state = "PRESENT"; check.reason = "calibrated_named_path_observed"; }
     else if (!check.pathCalibrationValid || !check.uidCoverageComplete || !check.pathCoverageComplete
              || !check.testedUidCount || !check.testedPathCount || check.missingPathCount != check.testedPathCount)
         check.reason = "named_path_coverage_incomplete";
@@ -144,15 +181,33 @@ struct Layout {
     std::vector<Probe> controls;
     std::map<int, std::string> uidPaths;
     std::string positivePath;
+    bool rootCalibrated = false, rootAbsent = false, catalogFresh = false;
+    bool freshCoverageThisSample = false, validatedThisSample = false, refreshing = true;
+    int positiveUid = -1;
+    int64_t catalogAgeMs = -1;
+    size_t scanCompleted = 0, scanTotal = 0, scannedThisSample = 0;
+    std::set<int> usableUids;
+    std::map<int, std::vector<Probe>> uidControls;
+    struct stat rootInfo{};
     void json(std::ostream& out) const {
         out << "{\"root\":" << quote(root) << ",\"active\":" << active << ",\"calibrated\":" << calibrated
-            << ",\"uidCount\":" << uidPaths.size() << ",\"catalogComplete\":" << catalogComplete << ",\"controls\":";
+            << ",\"uidCount\":" << uidPaths.size() << ",\"usableUidCount\":" << usableUids.size()
+            << ",\"catalogComplete\":" << catalogComplete << ",\"catalogFresh\":" << catalogFresh
+            << ",\"catalogAgeMs\":" << catalogAgeMs << ",\"refreshing\":" << refreshing
+            << ",\"freshCoverageThisSample\":" << freshCoverageThisSample
+            << ",\"validatedThisSample\":" << validatedThisSample
+            << ",\"scanCompleted\":" << scanCompleted << ",\"scanTotal\":" << scanTotal
+            << ",\"scannedThisSample\":" << scannedThisSample << ",\"controls\":";
         probeArray(out, controls); out << '}';
     }
 };
 struct Result {
     bool complete = true, available = false, calibrationValid = false, uidComplete = true, errorsTruncated = false;
     bool preflightComplete = false, procScanSkipped = true;
+    bool missingDetectionAvailable = false, freshCoverageThisSample = false;
+    bool catalogFresh = false, catalogRefreshing = true, catalogValidatedThisSample = false;
+    int64_t catalogAgeMs = -1;
+    size_t catalogScanCompleted = 0, catalogScanTotal = 0;
     int error = 0; unsigned sampleIndex = 0; uint64_t durationMs = 0, generation = 0;
     size_t uidCount = 0, uidProbeCount = 0, pathProbeCount = 0, completedPidCount = 0, eligiblePidCount = 0, errorCount = 0;
     std::string status = "unavailable";
@@ -168,6 +223,8 @@ struct Result {
     void json(std::ostream& out) const {
         out << "{\"method\":\"stat_uid_pid_paths\",\"coverageScope\":\"observed_uid_catalog\""
             << ",\"complete\":" << complete << ",\"available\":" << available << ",\"calibrationValid\":" << calibrationValid
+            << ",\"missingDetectionAvailable\":" << missingDetectionAvailable
+            << ",\"freshCoverageThisSample\":" << freshCoverageThisSample
             << ",\"errno\":" << error << ",\"status\":" << quote(status) << ",\"sampleIndex\":" << sampleIndex
             << ",\"durationMs\":" << durationMs << ",\"preflightComplete\":" << preflightComplete
             << ",\"procScanSkipped\":" << procScanSkipped << ",\"eligiblePidCount\":" << eligiblePidCount
@@ -175,12 +232,16 @@ struct Result {
             << ",\"errorCount\":" << errorCount << ",\"errorsTruncated\":" << errorsTruncated
             << ",\"uidCatalog\":{\"complete\":" << uidComplete << ",\"generation\":" << generation
             << ",\"uidCount\":" << uidCount << ",\"probeCount\":" << uidProbeCount
+            << ",\"ageMs\":" << catalogAgeMs << ",\"ttlMs\":10000,\"fresh\":" << catalogFresh
+            << ",\"refreshing\":" << catalogRefreshing << ",\"discoveredThisSample\":" << freshCoverageThisSample
+            << ",\"validatedThisSample\":" << catalogValidatedThisSample
+            << ",\"scanCompleted\":" << catalogScanCompleted << ",\"scanTotal\":" << catalogScanTotal
             << ",\"scope\":\"observed_uid_catalog\",\"rangeEndInclusive\":true,\"ranges\":[";
         for (size_t i = 0; i < ranges.size(); ++i) {
             if (i) out << ',';
             out << "{\"start\":" << ranges[i].first << ",\"end\":" << ranges[i].second << '}';
         }
-        out << "],\"meaning\":\"fresh named UID directories in these finite ranges; not an exhaustive Android UID or cgroup membership inventory\"}"
+        out << "],\"meaning\":\"cached or incrementally discovered names are candidates only; complete requires this sample's full finite-range discovery and revalidation, never exhaustive Android UID or kernel membership coverage\"}"
             << ",\"procControls\":"; probeArray(out, procControls);
         out << ",\"layouts\":[";
         for (size_t i = 0; i < layouts.size(); ++i) { if (i) out << ','; layouts[i].json(out); }
@@ -194,17 +255,38 @@ struct Result {
     }
 };
 class Scanner {
-    static constexpr uint64_t durationLimitNs = 650000000ULL;
-    static constexpr size_t probeLimit = 500000, byteLimit = 8 * 1024 * 1024;
+    static constexpr uint64_t durationLimitNs = 650000000ULL, discoveryLimitNs = 350000000ULL;
+    static constexpr uint64_t uidValidationLimitNs = 425000000ULL, preflightLimitNs = 450000000ULL, targetLimitNs = 600000000ULL;
+    static constexpr uint64_t catalogTtlNs = 10000000000ULL;
+    static constexpr size_t probeLimit = 500000, byteLimit = 8 * 1024 * 1024, discoveryChunk = 128;
+    struct Catalog {
+        std::set<int> known;
+        std::set<int> sweepNames;
+        size_t cursor = 0;
+        unsigned sweepSample = 0;
+        uint64_t sweepBegan = 0, completedBegan = 0;
+        bool sweeping = false, sweepValid = true, established = false;
+        std::string rootIdentity;
+    };
+    Io ownedIo;
+    Io& io;
     Result result;
-    uint64_t began = now(), generation = 0;
-    size_t probes = 0, bytes = 0;
+    uint64_t began = 0, generation = 0, probeTimeNs = 0;
+    size_t probes = 0, bytes = 0, nextLayout = 0;
     bool exhausted = false, procCalibrated = false;
-    int nextPid = 0;
+    int nextPid = 0, catalogOwner = -1;
     std::string previousCatalog;
+    std::map<std::string, Catalog> catalogs;
+    uint64_t elapsed() {
+        const uint64_t current = io.timeNs();
+        return current >= began ? current - began : UINT64_MAX;
+    }
+    bool within(uint64_t limit, size_t reserve = 0) {
+        return reserve < probeLimit && !exhausted && elapsed() < limit && probes < probeLimit - reserve && bytes < byteLimit;
+    }
     bool budget(const std::string& path) {
         if (exhausted) return false;
-        if (now() - began > durationLimitNs || probes >= probeLimit || bytes >= byteLimit) {
+        if (!within(durationLimitNs)) {
             result.fail(path, EOVERFLOW, "scan_budget_exhausted"); exhausted = true; return false;
         }
         return true;
@@ -212,28 +294,19 @@ class Scanner {
     Probe probe(const std::string& path, struct stat* info = nullptr) {
         Probe value{path, EOVERFLOW};
         if (!budget(path)) return value;
-        ++probes; struct stat local{};
-        const int rc = fstatat(AT_FDCWD, path.c_str(), &local, AT_SYMLINK_NOFOLLOW);
-        value.error = rc ? errno : S_ISDIR(local.st_mode) ? 0 : ENOTDIR;
+        ++probes; struct stat local{}; const uint64_t started = io.timeNs();
+        value.error = io.statDirectory(path, local);
+        const uint64_t ended = io.timeNs();
+        if (ended >= started) probeTimeNs += ended - started;
         if (!value.error && info) *info = local;
         return value;
     }
     bool readFile(const std::string& path, std::string& out, size_t limit, int& error) {
         if (!budget(path)) { error = EOVERFLOW; return false; }
-        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
-        if (fd < 0) { error = errno; return false; }
-        bool ok = false; char buffer[4096];
-        for (;;) {
-            if (!budget(path)) { error = EOVERFLOW; break; }
-            const size_t room = limit >= out.size() ? limit - out.size() : 0;
-            const ssize_t n = read(fd, buffer, std::min(sizeof(buffer), room + 1));
-            if (n < 0) { if (errno == EINTR) continue; error = errno; break; }
-            if (!n) { ok = true; break; }
-            bytes += size_t(n);
-            if (size_t(n) > room) { error = EOVERFLOW; break; }
-            out.append(buffer, size_t(n));
-        }
-        close(fd); return ok;
+        const bool ok = io.readText(path, out, std::min(limit, byteLimit - bytes), error);
+        bytes += out.size();
+        if (!budget(path)) { error = EOVERFLOW; return false; }
+        return ok;
     }
     Life life(int pid) {
         Life value; const std::string path = "/proc/" + std::to_string(pid); struct stat info{};
@@ -251,173 +324,377 @@ class Scanner {
         const std::pair<int, int> range{first, last};
         if (std::find(result.ranges.begin(), result.ranges.end(), range) == result.ranges.end()) result.ranges.push_back(range);
     }
-    void discover(Layout& layout, const std::map<int, Held>& held) {
-        layout.controls.push_back(probe(layout.root));
-        if (layout.controls.back().error == ENOENT) return;
-        const Probe badUid = probe(layout.root + "/uid_"), badNumber = probe(layout.root + "/uid_2147483647");
-        layout.controls.push_back(badUid); layout.controls.push_back(badNumber);
-        if (!calibrated(layout.controls[0].error, badUid.error, badNumber.error)) {
-            layout.active = true; layout.catalogComplete = false; result.uidComplete = false;
+    size_t rangeSize() const {
+        size_t count = 0;
+        for (const auto& range : result.ranges) count += size_t(range.second - range.first) + 1;
+        return count;
+    }
+    int uidAt(size_t offset) const {
+        for (const auto& range : result.ranges) {
+            const size_t size = size_t(range.second - range.first) + 1;
+            if (offset < size) return range.first + int(offset);
+            offset -= size;
+        }
+        return -1;
+    }
+    bool inRange(int uid) const {
+        for (const auto& range : result.ranges) if (uid >= range.first && uid <= range.second) return true;
+        return false;
+    }
+    static std::string rootIdentity(const Probe& root, const struct stat& info) {
+        return std::to_string(root.error) + ":" + std::to_string(uint64_t(info.st_dev))
+            + ":" + std::to_string(uint64_t(info.st_ino));
+    }
+    void remember(Catalog& catalog, int uid, const Probe& observed) {
+        if (presenceHint(observed.error)) {
+            catalog.known.insert(uid); catalog.sweepNames.insert(uid);
+        } else if (observed.error == ENOENT) {
+            catalog.known.erase(uid); catalog.sweepNames.erase(uid);
+        } else {
+            catalog.sweepValid = false;
+            result.fail(observed.path, observed.error, "uid_probe_ambiguous");
+        }
+    }
+    void prepare(Layout& layout, unsigned sample) {
+        Catalog& catalog = catalogs[layout.root];
+        const Probe root = probe(layout.root, &layout.rootInfo);
+        layout.controls.push_back(root); layout.active = root.error != ENOENT;
+        const std::string identity = rootIdentity(root, layout.rootInfo);
+        if (catalog.rootIdentity != identity) { catalog = Catalog{}; catalog.rootIdentity = identity; }
+        if (root.error == ENOENT) {
+            catalog.known.clear(); catalog.sweeping = catalog.established = false;
+            layout.rootAbsent = layout.freshCoverageThisSample = layout.validatedThisSample = true;
+            layout.catalogComplete = true; layout.refreshing = false; return;
+        }
+        layout.scanTotal = rangeSize();
+        const Probe negative = probe(layout.root + "/uid_"), negativeNumber = probe(layout.root + "/uid_2147483647");
+        layout.controls.push_back(negative); layout.controls.push_back(negativeNumber);
+        layout.rootCalibrated = calibrated(root.error, negative.error, negativeNumber.error);
+        if (!layout.rootCalibrated) {
+            catalog.sweeping = catalog.established = false; catalog.cursor = 0;
+            layout.catalogComplete = false;
             result.fail(layout.root, EACCES, "uid_negative_controls_not_distinguishable"); return;
         }
-        for (const auto& range : result.ranges) {
-            for (int uid = range.first; uid <= range.second; ++uid) {
-                const std::string path = layout.root + "/uid_" + std::to_string(uid);
-                const Probe found = probe(path); ++result.uidProbeCount;
-                if (presenceHint(found.error)) layout.uidPaths.emplace(uid, path);
-                else if (found.error != ENOENT) {
-                    layout.catalogComplete = false; result.uidComplete = false;
-                    if (!exhausted) result.fail(path, found.error, "uid_probe_ambiguous");
+        if (!catalog.sweeping) {
+            catalog.sweeping = true; catalog.cursor = 0; catalog.sweepNames.clear();
+            catalog.sweepValid = true; catalog.sweepSample = sample; catalog.sweepBegan = io.timeNs();
+        }
+        // Seed a positive candidate immediately; progress through the full ranges is independent.
+        for (int uid : {io.uid(), 0}) {
+            if (!inRange(uid)) continue;
+            const Probe found = probe(layout.root + "/uid_" + std::to_string(uid));
+            ++result.uidProbeCount; remember(catalog, uid, found);
+        }
+    }
+    void discover(unsigned sample) {
+        std::set<size_t> finished;
+        size_t visited = 0;
+        while (within(discoveryLimitNs, 4096) && visited < result.layouts.size()) {
+            const size_t index = nextLayout++ % result.layouts.size();
+            Layout& layout = result.layouts[index];
+            Catalog& catalog = catalogs[layout.root];
+            if (!layout.rootCalibrated || finished.count(index)) { ++visited; continue; }
+            visited = 0;
+            size_t chunk = 0;
+            while (chunk++ < discoveryChunk && catalog.cursor < layout.scanTotal && within(discoveryLimitNs, 4096)) {
+                const int uid = uidAt(catalog.cursor);
+                const Probe found = probe(layout.root + "/uid_" + std::to_string(uid));
+                ++result.uidProbeCount; ++layout.scannedThisSample;
+                remember(catalog, uid, found); ++catalog.cursor;
+            }
+            layout.scanCompleted = catalog.cursor;
+            if (catalog.cursor == layout.scanTotal) {
+                layout.freshCoverageThisSample = catalog.sweepSample == sample && catalog.sweepValid;
+                catalog.established = catalog.sweepValid;
+                if (catalog.established) {
+                    catalog.completedBegan = catalog.sweepBegan;
+                    for (auto it = catalog.known.begin(); it != catalog.known.end();) {
+                        if (!catalog.sweepNames.count(*it)) it = catalog.known.erase(it); else ++it;
+                    }
                 }
-                if (exhausted) break;
-            }
-            if (exhausted) break;
-        }
-        layout.active = !layout.uidPaths.empty() || !layout.catalogComplete;
-        if (!layout.active) return;
-        const auto own = layout.uidPaths.find(int(geteuid()));
-        if (own != layout.uidPaths.end()) {
-            // The collector inherits its app parent's group, not a pid_<collector> name.
-            for (int pid : {int(getppid()), int(getpid())}) {
-                Probe positive = probe(own->second + "/pid_" + std::to_string(pid));
-                layout.controls.push_back(positive);
-                if (presenceHint(positive.error)) { layout.positivePath = positive.path; break; }
+                catalog.sweeping = false; catalog.cursor = 0; finished.insert(index);
             }
         }
-        // The legacy system family may not contain the app. Calibrate a numeric path with a live held PID.
-        if (layout.positivePath.empty() && layout.root == "/sys/fs/cgroup/system") {
-            const auto rootUid = layout.uidPaths.find(0);
-            if (rootUid != layout.uidPaths.end()) for (const auto& entry : held) {
-                if (heldState(entry.second.fd) != 0) continue;
-                Probe positive = probe(rootUid->second + "/pid_" + std::to_string(entry.first));
-                if (presenceHint(positive.error)) { layout.controls.push_back(positive); layout.positivePath = positive.path; break; }
-                if (exhausted) break;
+        for (auto& layout : result.layouts) {
+            if (layout.rootAbsent) continue;
+            const auto& catalog = catalogs.at(layout.root);
+            if (catalog.sweeping) layout.scanCompleted = catalog.cursor;
+            layout.refreshing = catalog.sweeping || !catalog.established;
+            layout.catalogAgeMs = catalog.established && io.timeNs() >= catalog.completedBegan
+                ? int64_t((io.timeNs() - catalog.completedBegan) / 1000000ULL) : -1;
+            layout.catalogFresh = catalog.established && layout.catalogAgeMs >= 0
+                && uint64_t(layout.catalogAgeMs) < catalogTtlNs / 1000000ULL;
+            layout.catalogComplete = layout.freshCoverageThisSample;
+            if (layout.rootCalibrated) for (int uid : catalog.known)
+                layout.uidPaths.emplace(uid, layout.root + "/uid_" + std::to_string(uid));
+        }
+    }
+    bool positive(Layout& layout, int uid, int pid) {
+        if (!layout.usableUids.count(uid) || !within(preflightLimitNs, 2048)) return false;
+        const Probe value = probe(layout.uidPaths.at(uid) + "/pid_" + std::to_string(pid));
+        if (!presenceHint(value.error)) return false;
+        layout.positiveUid = uid; layout.positivePath = value.path; layout.controls.push_back(value); return true;
+    }
+    void calibrateUids(const std::map<int, Held>& held) {
+        std::vector<std::vector<int>> ordered(result.layouts.size());
+        std::vector<size_t> cursor(result.layouts.size(), 0);
+        for (size_t index = 0; index < result.layouts.size(); ++index) {
+            const auto& layout = result.layouts[index];
+            if (!layout.rootCalibrated) continue;
+            if (layout.uidPaths.count(io.uid())) ordered[index].push_back(io.uid());
+            for (const auto& uid : layout.uidPaths) if (uid.first != io.uid()) ordered[index].push_back(uid.first);
+        }
+        bool remaining = true;
+        while (remaining && within(uidValidationLimitNs, 3072)) {
+            remaining = false;
+            for (size_t index = 0; index < result.layouts.size() && within(uidValidationLimitNs, 3072); ++index) {
+                if (cursor[index] >= ordered[index].size()) continue;
+                remaining = true;
+                Layout& layout = result.layouts[index];
+                const int uid = ordered[index][cursor[index]++];
+                const std::string& path = layout.uidPaths.at(uid);
+                auto& controls = layout.uidControls[uid];
+                controls = {probe(path), probe(path + "/pid_"), probe(path + "/pid_2147483647")};
+                if (calibrated(controls[0].error, controls[1].error, controls[2].error)) {
+                    layout.usableUids.insert(uid);
+                    // Establish the App positive before a large UID catalog uses the preflight slice.
+                    if (uid == io.uid() && layout.positivePath.empty()
+                        && !positive(layout, uid, io.parentPid())) positive(layout, uid, io.pid());
+                }
+                else {
+                    layout.freshCoverageThisSample = false;
+                    if (controls[0].error == ENOENT) catalogs[layout.root].known.erase(uid);
+                    result.fail(path, ENODATA, "uid_pid_controls_not_calibrated");
+                }
             }
         }
-        bool controlsValid = !layout.positivePath.empty();
-        for (const auto& uid : layout.uidPaths) {
-            const Probe negative = probe(uid.second + "/pid_"), negativeNumber = probe(uid.second + "/pid_2147483647");
-            controlsValid = controlsValid && negative.error == ENOENT && negativeNumber.error == ENOENT;
-            if ((layout.controls.size() < 12 || negative.error != ENOENT || negativeNumber.error != ENOENT) && layout.controls.size() < 24) {
-                layout.controls.push_back(negative); layout.controls.push_back(negativeNumber);
+        for (auto& layout : result.layouts) {
+            if (!layout.rootCalibrated) continue;
+            layout.validatedThisSample = layout.usableUids.size() == layout.uidPaths.size();
+            if (!layout.validatedThisSample) layout.freshCoverageThisSample = false;
+            if (layout.positivePath.empty() && !positive(layout, io.uid(), io.parentPid())) positive(layout, io.uid(), io.pid());
+            // A layout need not contain our App. Bound the search for a held-live positive.
+            size_t attempts = 0;
+            if (layout.positivePath.empty()) for (int uid : layout.usableUids) {
+                for (const auto& entry : held) {
+                    if (++attempts > 64 || !within(preflightLimitNs, 2048)) break;
+                    if (io.pidfdState(entry.second.fd) != 0) continue;
+                    if (positive(layout, uid, entry.first)) {
+                        if (io.pidfdState(entry.second.fd) == 0) break;
+                        layout.controls.pop_back(); layout.positivePath.clear(); layout.positiveUid = -1;
+                    }
+                }
+                if (!layout.positivePath.empty() || attempts > 64 || !within(preflightLimitNs, 2048)) break;
             }
-            if (exhausted) break;
+            layout.calibrated = !layout.positivePath.empty() && !layout.usableUids.empty();
+            if (!layout.calibrated && !layout.uidPaths.empty()) {
+                layout.freshCoverageThisSample = false;
+                result.fail(layout.root, ENODATA, "pid_path_controls_not_calibrated");
+            }
+            layout.catalogComplete = layout.freshCoverageThisSample;
         }
-        layout.calibrated = controlsValid && !exhausted && layout.catalogComplete;
-        if (!layout.calibrated) result.fail(layout.root, ENODATA, "pid_path_controls_not_calibrated");
+    }
+    void summarize() {
+        bool allCoverage = true, allValidated = true, allFresh = true, anyRoot = false;
+        bool available = false; std::set<int> uids;
+        result.catalogScanCompleted = result.catalogScanTotal = 0;
+        result.catalogAgeMs = -1; result.catalogRefreshing = false;
+        for (const auto& layout : result.layouts) {
+            available = available || layout.calibrated;
+            allCoverage = allCoverage && layout.freshCoverageThisSample;
+            allValidated = allValidated && layout.validatedThisSample;
+            result.catalogScanCompleted += layout.scanCompleted; result.catalogScanTotal += layout.scanTotal;
+            if (!layout.rootAbsent) {
+                anyRoot = true; allFresh = allFresh && layout.catalogFresh;
+                result.catalogRefreshing = result.catalogRefreshing || layout.refreshing;
+                result.catalogAgeMs = std::max(result.catalogAgeMs, layout.catalogAgeMs);
+            }
+            for (const auto& uid : layout.uidPaths) uids.insert(uid.first);
+        }
+        result.uidCount = uids.size();
+        result.available = result.calibrationValid = procCalibrated && available;
+        result.freshCoverageThisSample = procCalibrated && allCoverage && allValidated;
+        result.uidComplete = result.missingDetectionAvailable = result.available && result.freshCoverageThisSample;
+        result.catalogValidatedThisSample = procCalibrated && allValidated;
+        result.catalogFresh = anyRoot && allFresh;
+        if (!result.missingDetectionAvailable) result.complete = false;
+    }
+    void catalogGeneration() {
+        std::ostringstream signature;
+        for (const auto& layout : result.layouts) {
+            signature << layout.root << ':' << catalogs[layout.root].rootIdentity << ':';
+            for (const auto& uid : layout.uidPaths) signature << uid.first << ',';
+            signature << ';';
+        }
+        if (signature.str() != previousCatalog) { previousCatalog = signature.str(); ++generation; }
+        result.generation = generation;
+    }
+    bool revalidate(const std::vector<Probe>& controls, bool exactPositive = false, size_t first = 0) {
+        bool valid = true;
+        for (size_t index = first; index < controls.size(); ++index) {
+            const auto& control = controls[index];
+            const Probe after = probe(control.path);
+            valid = valid && (control.error == ENOENT ? after.error == ENOENT
+                : exactPositive ? after.error == 0 : presenceHint(after.error));
+        }
+        return valid;
+    }
+    size_t finalProbeReserve() const {
+        size_t count = result.procControls.size() + 16;
+        for (const auto& layout : result.layouts) {
+            count += layout.controls.size();
+            for (int uid : layout.usableUids) count += layout.uidControls.at(uid).size();
+        }
+        return count;
+    }
+    uint64_t targetDeadline(size_t reserve) const {
+        // Reserve measured syscall time as well as a probe count. A large catalog
+        // must not spend the controls' budget on more target PID combinations.
+        const uint64_t average = probes ? probeTimeNs / probes : 0;
+        const uint64_t perProbe = average > durationLimitNs / 2 ? durationLimitNs : average * 2;
+        if (reserve >= probeLimit || (perProbe && reserve > durationLimitNs / perProbe)) return 0;
+        const uint64_t needed = uint64_t(reserve) * perProbe + 10000000ULL;
+        return needed >= durationLimitNs ? 0 : std::min(targetLimitNs, durationLimitNs - needed);
+    }
+    void finalControls() {
+        // Check shared proc evidence first; later local failures must not revoke other layouts.
+        const bool procValid = revalidate(result.procControls, true);
+        if (!procValid) {
+            procCalibrated = false; result.fail("/proc", ESTALE, "proc_controls_changed_or_budget_exhausted");
+        }
+        for (auto& layout : result.layouts) {
+            struct stat rootAfter{};
+            const Probe root = probe(layout.root, &rootAfter);
+            const bool sameRoot = rootIdentity(root, rootAfter) == catalogs[layout.root].rootIdentity;
+            const bool controlsValid = revalidate(layout.controls, false, 1);
+            const bool rootValid = sameRoot && controlsValid;
+            if (!rootValid) {
+                layout.calibrated = layout.rootCalibrated = layout.validatedThisSample = layout.freshCoverageThisSample = false;
+                layout.catalogFresh = false; layout.catalogAgeMs = -1; layout.refreshing = true;
+                layout.usableUids.clear();
+                auto& catalog = catalogs[layout.root]; catalog.sweeping = catalog.established = false; catalog.cursor = 0;
+                result.fail(layout.root, ESTALE, "layout_controls_changed_or_budget_exhausted");
+            } else if (layout.rootAbsent) continue;
+            else if (layout.rootCalibrated) {
+                std::vector<int> order;
+                if (layout.usableUids.count(layout.positiveUid)) order.push_back(layout.positiveUid);
+                for (int uid : layout.usableUids) if (uid != layout.positiveUid) order.push_back(uid);
+                for (int uid : order) {
+                    if (!revalidate(layout.uidControls.at(uid))) {
+                        layout.usableUids.erase(uid);
+                        layout.validatedThisSample = layout.freshCoverageThisSample = false;
+                        result.fail(layout.uidPaths.at(uid), ESTALE, "uid_controls_changed_or_budget_exhausted");
+                    }
+                }
+                layout.calibrated = layout.calibrated && layout.usableUids.count(layout.positiveUid) && !layout.usableUids.empty();
+                if (!layout.calibrated && !layout.uidPaths.empty()) layout.freshCoverageThisSample = false;
+            }
+            layout.catalogComplete = layout.freshCoverageThisSample;
+        }
+        summarize();
+        result.completedPidCount = 0;
+        for (auto& entry : result.processes) {
+            auto& check = entry.second.check;
+            bool positiveValid = false;
+            if (check.pathFound && procCalibrated) for (const auto& layout : result.layouts)
+                if (layout.root == check.observedLayout && layout.calibrated && layout.usableUids.count(check.observedUid)) positiveValid = true;
+            check.uidCoverageComplete = result.uidComplete;
+            if (check.pathFound) check.pathCalibrationValid = positiveValid;
+            else check.pathCalibrationValid = result.missingDetectionAvailable;
+            if (!check.pathCalibrationValid || !check.uidCoverageComplete) check.pathCoverageComplete = false;
+            if (check.state == "PRESENT" && !positiveValid) {
+                check.state = "UNKNOWN"; check.pathFound = false; check.reason = "matched_path_controls_changed_or_budget_exhausted";
+            } else if (check.state == "MISSING" && !result.missingDetectionAvailable) {
+                check.state = "UNKNOWN"; check.reason = "named_path_coverage_incomplete";
+            }
+            if (check.pathFound || check.pathCoverageComplete) ++result.completedPidCount;
+        }
     }
     Result finish() {
-        result.durationMs = (now() - began) / 1000000ULL;
+        result.durationMs = elapsed() / 1000000ULL;
         result.status = result.complete && result.available ? "complete" : result.available ? "partial" : "unavailable";
         return std::move(result);
     }
 public:
+    Scanner() : io(ownedIo) { began = io.timeNs(); io.setReadDeadline(began + durationLimitNs); }
+    explicit Scanner(Io& value) : io(value) { began = io.timeNs(); io.setReadDeadline(began + durationLimitNs); }
     Life recheck(int pid) { return life(pid); }
     bool truncationSelfTest() {
         std::string text; int error = 0;
         return !readFile("/proc/self/stat", text, 1, error) && error == EOVERFLOW;
     }
     Result run(const std::set<int>& excluded, const std::map<int, Held>& held, unsigned sample, bool enabled) {
-        result = Result{}; result.sampleIndex = sample; began = now(); probes = bytes = 0; exhausted = procCalibrated = false;
+        result = Result{}; result.uidComplete = false; result.sampleIndex = sample; began = io.timeNs();
+        io.setReadDeadline(began + durationLimitNs);
+        probes = bytes = 0; probeTimeNs = 0; exhausted = procCalibrated = false;
         if (!enabled) { result.fail("", ENOTSUP, "diagnostic_mode"); return finish(); }
-        result.procControls = {probe("/proc/" + std::to_string(getpid())), probe("/proc/pid_"), probe("/proc/2147483647")};
-        struct statfs fs{};
+        result.procControls = {probe("/proc/" + std::to_string(io.pid())), probe("/proc/pid_"), probe("/proc/2147483647")};
         procCalibrated = result.procControls[0].error == 0 && result.procControls[1].error == ENOENT
-            && result.procControls[2].error == ENOENT && !statfs("/proc", &fs) && uint64_t(fs.f_type) == 0x9fa0;
+            && result.procControls[2].error == ENOENT && io.isProcFs();
         if (!procCalibrated) { result.fail("/proc", EACCES, "proc_presence_controls_not_calibrated"); return finish(); }
+        if (catalogOwner != io.uid()) { catalogs.clear(); previousCatalog.clear(); catalogOwner = io.uid(); }
         addRange(0, 19999); addRange(90000, 99999);
-        const int userBase = (int(geteuid()) / 100000) * 100000;
+        const int userBase = (io.uid() / 100000) * 100000;
         if (userBase > 0 && userBase <= INT_MAX - 99999) { addRange(userBase, userBase + 19999); addRange(userBase + 90000, userBase + 99999); }
         for (const char* root : {"/sys/fs/cgroup", "/sys/fs/cgroup/apps", "/sys/fs/cgroup/system"}) {
-            Layout layout; layout.root = root; discover(layout, held); result.layouts.push_back(std::move(layout));
-            if (exhausted) { result.uidComplete = false; break; }
+            Layout layout; layout.root = root; prepare(layout, sample); result.layouts.push_back(std::move(layout));
         }
-        bool anyLayout = false, allCalibrated = true;
-        std::set<int> uids; std::ostringstream signature;
-        for (const auto& layout : result.layouts) {
-            if (!layout.active) continue;
-            anyLayout = true; allCalibrated = allCalibrated && layout.calibrated;
-            signature << layout.root << ':';
-            for (const auto& uid : layout.uidPaths) { uids.insert(uid.first); signature << uid.first << ','; }
-            signature << ';';
+        discover(sample); calibrateUids(held); summarize(); catalogGeneration();
+        result.preflightComplete = result.freshCoverageThisSample;
+        if (!result.available) {
+            result.fail("/sys/fs/cgroup", ENODATA, "no_calibrated_observable_named_layout"); return finish();
         }
-        result.uidCount = uids.size(); result.calibrationValid = anyLayout && allCalibrated && result.uidComplete;
-        result.available = result.calibrationValid;
-        if (!result.available) { result.fail("/sys/fs/cgroup", ENODATA, "no_complete_calibrated_named_layout"); return finish(); }
-        if (signature.str() != previousCatalog) { previousCatalog = signature.str(); ++generation; }
-        result.generation = generation; result.preflightComplete = true; result.procScanSkipped = false;
+        result.procScanSkipped = false;
+        if (!result.freshCoverageThisSample) result.fail("/sys/fs/cgroup", EAGAIN, "uid_catalog_partial_or_cached");
         std::vector<int> pids;
         for (const auto& entry : held) if (!excluded.count(entry.first)) pids.push_back(entry.first);
         result.eligiblePidCount = pids.size();
         const auto start = std::lower_bound(pids.begin(), pids.end(), nextPid);
         std::rotate(pids.begin(), start, pids.end()); nextPid = 0;
+        const size_t finalReserve = finalProbeReserve();
+        const uint64_t targetEnd = targetDeadline(finalReserve);
         for (int pid : pids) {
-            // Leave 50 ms for the final controls. A bounded partial batch must not
-            // erase already completed PID observations solely because other PIDs wait.
-            if (now() - began >= 600000000ULL || probes >= probeLimit - 2048) {
-                result.fail("/proc", EOVERFLOW, "target_path_batch_limit"); nextPid = pid; break;
-            }
-            if (!budget("/proc/" + std::to_string(pid))) { nextPid = pid; break; }
+            if (!within(targetEnd, finalReserve)) { result.fail("/proc", EOVERFLOW, "target_path_batch_limit"); nextPid = pid; break; }
             const Held& identity = held.at(pid);
             Observation observation; Check& check = observation.check;
             check.sampleIndex = sample; check.identityToken = identity.identity;
             check.uidCatalogGeneration = generation; check.uidCoverageComplete = result.uidComplete;
             check.pathCalibrationValid = result.calibrationValid;
-            const int beforeHeld = heldState(identity.fd);
+            const int beforeHeld = io.pidfdState(identity.fd);
             observation.before = life(pid);
-            std::set<int> testedUids;
-            bool partial = false;
+            std::set<int> testedUids; bool partial = false;
             if (beforeHeld == 0 && observation.before.present) {
                 for (const auto& layout : result.layouts) {
-                    if (!layout.active) continue;
-                    for (const auto& uid : layout.uidPaths) {
-                        if (now() - began >= 600000000ULL || probes >= probeLimit - 2048) { partial = true; break; }
-                        const Probe value = probe(uid.second + "/pid_" + std::to_string(pid));
-                        ++check.testedPathCount; ++result.pathProbeCount; testedUids.insert(uid.first);
+                    if (!layout.calibrated) continue;
+                    for (int uid : layout.usableUids) {
+                        if (!within(targetEnd, finalReserve)) { partial = true; break; }
+                        const Probe value = probe(layout.uidPaths.at(uid) + "/pid_" + std::to_string(pid));
+                        ++check.testedPathCount; ++result.pathProbeCount; testedUids.insert(uid);
                         if (check.paths.size() < 4 || (presenceHint(value.error) && check.paths.size() < 5)) check.paths.push_back(value);
                         if (value.error == ENOENT) ++check.missingPathCount;
-                        else if (presenceHint(value.error)) { check.pathFound = true; break; }
-                        if (exhausted) break;
+                        else if (presenceHint(value.error)) {
+                            check.pathFound = true; check.observedLayout = layout.root; check.observedUid = uid; break;
+                        }
                     }
                     if (check.pathFound || exhausted || partial) break;
                 }
                 check.testedUidCount = testedUids.size();
-                check.pathCoverageComplete = !exhausted && !partial && !check.pathFound
+                check.pathCoverageComplete = result.missingDetectionAvailable && !exhausted && !partial && !check.pathFound
                     && check.testedUidCount == result.uidCount && check.testedPathCount == check.missingPathCount;
             }
             observation.after = life(pid);
-            const int afterHeld = heldState(identity.fd);
+            const int afterHeld = io.pidfdState(identity.fd);
             const bool binding = !identity.startKnown || ((!observation.before.parsed || identity.start == observation.before.start)
                 && (!observation.after.parsed || identity.start == observation.after.start));
             evaluate(check, observation.before, observation.after, beforeHeld, afterHeld, binding);
-            if (check.pathCoverageComplete || check.pathFound) ++result.completedPidCount;
             result.processes.emplace(pid, std::move(observation));
-            if (exhausted) { nextPid = pid; break; }
-            if (partial) { result.fail("/proc", EOVERFLOW, "target_path_batch_limit"); nextPid = pid; break; }
+            if (exhausted || partial) { result.fail("/proc", EOVERFLOW, "target_path_batch_limit"); nextPid = pid; break; }
         }
-        bool afterControls = !exhausted;
-        for (const auto& layout : result.layouts) {
-            if (!layout.active) continue;
-            for (const auto& control : layout.controls) {
-                const Probe after = probe(control.path);
-                afterControls = afterControls && (control.error == ENOENT ? after.error == ENOENT : presenceHint(after.error));
-            }
-        }
-        for (const auto& control : result.procControls) {
-            const Probe after = probe(control.path);
-            afterControls = afterControls && (control.error == ENOENT ? after.error == ENOENT : after.error == 0);
-        }
-        if (!afterControls) {
-            result.calibrationValid = false; result.available = false;
-            result.fail("/sys/fs/cgroup", ESTALE, "path_controls_changed_or_budget_exhausted");
-            for (auto& entry : result.processes) {
-                auto& check = entry.second.check; check.pathCalibrationValid = false;
-                if (check.state == "MISSING") { check.state = "UNKNOWN"; check.reason = "path_controls_changed_or_budget_exhausted"; }
-            }
-        }
+        finalControls();
         return finish();
     }
 };
+
 inline bool selfTest() {
     bool ok = calibrated(0, ENOENT, ENOENT) && calibrated(EACCES, ENOENT, ENOENT)
         && !calibrated(EACCES, EACCES, ENOENT) && !calibrated(ENOENT, ENOENT, ENOENT)

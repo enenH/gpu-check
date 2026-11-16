@@ -37,6 +37,17 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
+      - name: Run cgroup regressions
+        run: |
+          python3 scripts/test-cgroup-native.py --sanitize
+          mkdir -p build/cgroup-watch-tests
+          javac -encoding UTF-8 -d build/cgroup-watch-tests \
+            app/src/main/java/com/gpucheck/app/CgroupWatchPolicy.java \
+            app/src/main/java/com/gpucheck/app/MonitoredProcessFilter.java \
+            app/src/main/java/com/gpucheck/app/RootProcessFilter.java \
+            tests/CgroupWatchPolicyTest.java
+          java -ea -cp build/cgroup-watch-tests com.gpucheck.app.CgroupWatchPolicyTest
+
       - name: Install Android build dependencies
         # Keep these versions aligned with app/build.gradle and AGP 9.5.
         run: |
@@ -49,7 +60,7 @@ jobs:
         run: >-
           ./gradlew --no-daemon --stacktrace
           "-PgpuCheckNdkVersion=${GPU_CHECK_NDK_VERSION}"
-          :app:assembleDebug :app:assembleRelease :app:lintDebug
+          :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest :app:lintDebug
 
       - name: Prepare release files
         run: |

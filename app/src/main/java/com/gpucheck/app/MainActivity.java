@@ -650,7 +650,9 @@ public final class MainActivity extends Activity {
             permissionStatus.setText(getString(R.string.ordinary_mode, uidText(currentReport.optInt("collectorUid", -1))));
             updateGlobalGpuStatus();
             boolean cgroupUnavailable = isCgroupCheckUnavailable();
-            boolean incomplete = denied > 0 || cgroupUnavailable || (errors != null && errors.length() > 0);
+            boolean cgroupPartial = isCgroupPathProbePartial();
+            boolean incomplete = denied > 0 || cgroupUnavailable || cgroupPartial
+                    || (errors != null && errors.length() > 0);
             riskCount.setText(String.format(Locale.getDefault(), "%d", high));
             int riskColor = high > 0 ? RED : rootWatch > 0 || anomalyCount > 0 || incomplete ? AMBER : TEXT;
             riskCount.setTextColor(riskColor);
@@ -691,7 +693,8 @@ public final class MainActivity extends Activity {
             String time = timestamp > 0 ? new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(timestamp)) : "—";
             String samplingStatus = getString(R.string.sampling_status, time,
                     currentReport.optInt("scannedProcesses", 0), denied);
-            if (isCgroupPathProbeAvailable()) samplingStatus += "\n" + getString(R.string.cgroup_check_available);
+            if (isCgroupPathProbeAvailable()) samplingStatus += "\n" + getString(cgroupPartial
+                    ? R.string.cgroup_check_partial : R.string.cgroup_check_available);
             sampleStatus.setText(samplingStatus);
             StringBuilder error = new StringBuilder();
             if (errors != null) {
@@ -965,6 +968,13 @@ public final class MainActivity extends Activity {
         JSONObject scan = cgroupPathScan();
         return !isStartingReport() && scan != null && scan.optBoolean("available")
                 && scan.optBoolean("calibrationValid");
+    }
+
+    private boolean isCgroupPathProbePartial() {
+        JSONObject scan = cgroupPathScan();
+        return isCgroupPathProbeAvailable() && scan != null
+                && (!scan.optBoolean("missingDetectionAvailable", true)
+                    || !scan.optBoolean("freshCoverageThisSample", true));
     }
 
     private JSONObject cgroupPathScan() {
@@ -1580,6 +1590,12 @@ public final class MainActivity extends Activity {
         JSONObject scan = cgroupPathScan();
         if (scan != null) {
             detail.append("\n路径探测校准有效：").append(evidenceFlag(scan, "calibrationValid")).append('\n');
+            if (scan.has("missingDetectionAvailable")) {
+                detail.append("本轮可判定路径缺失：")
+                        .append(evidenceFlag(scan, "missingDetectionAvailable")).append('\n');
+                detail.append("本轮 UID 范围重新探测完整：")
+                        .append(evidenceFlag(scan, "freshCoverageThisSample")).append('\n');
+            }
             JSONArray procControls = scan.optJSONArray("procControls");
             for (int i = 0; procControls != null && i < procControls.length(); i++) {
                 appendPathProbe(detail, "proc 路径对照", procControls.optJSONObject(i));
@@ -1591,6 +1607,11 @@ public final class MainActivity extends Activity {
                 detail.append("cgroup 布局：").append(layout.optString("root", "未提供"))
                         .append(" · 启用：").append(evidenceFlag(layout, "active"))
                         .append(" · 校准有效：").append(evidenceFlag(layout, "calibrated")).append('\n');
+                if (layout.has("usableUidCount")) {
+                    detail.append("本轮可观察 UID 数：").append(layout.optInt("usableUidCount"))
+                            .append(" · 本轮完整覆盖：").append(evidenceFlag(layout, "freshCoverageThisSample"))
+                            .append('\n');
+                }
                 JSONArray controls = layout.optJSONArray("controls");
                 for (int n = 0; controls != null && n < controls.length(); n++) {
                     JSONObject control = controls.optJSONObject(n);
@@ -1602,16 +1623,24 @@ public final class MainActivity extends Activity {
                 detail.append("UID 目录覆盖范围：").append("observed_uid_catalog".equals(catalog.optString("scope"))
                         ? "已观察到的 UID 目录" : catalog.optString("scope", "未提供")).append('\n');
                 detail.append("已观察 UID 目录数：").append(catalog.optInt("uidCount"))
-                        .append(" · 编目完成：").append(evidenceFlag(catalog, "complete")).append('\n');
+                        .append(" · 本轮覆盖完整：").append(evidenceFlag(catalog, "complete")).append('\n');
+                if (catalog.has("scanTotal")) {
+                    detail.append("UID 发现进度：").append(catalog.optLong("scanCompleted"))
+                            .append(" / ").append(catalog.optLong("scanTotal")).append('\n');
+                    detail.append("本轮重新验证目录：").append(evidenceFlag(catalog, "validatedThisSample"))
+                            .append(" · 后台继续发现：").append(evidenceFlag(catalog, "refreshing")).append('\n');
+                }
                 detail.append("已探测 UID 数字范围：").append(uidRanges(catalog.optJSONArray("ranges"))).append('\n');
                 if (catalog.has("generation")) detail.append("目录编目代次：").append(catalog.optLong("generation")).append('\n');
-                if (catalog.has("ageMs")) detail.append("目录编目距今：").append(catalog.optLong("ageMs")).append(" ms\n");
+                if (catalog.optLong("ageMs", -1) >= 0) detail.append("目录发现记录年龄：")
+                        .append(catalog.optLong("ageMs")).append(" ms\n");
                 if (check != null && check.has("uidCatalogGeneration")) {
                     detail.append("本进程使用的编目代次：").append(check.optLong("uidCatalogGeneration")).append('\n');
                 }
             }
         }
         detail.append("这里只核对参考命名的 UID/PID 目录；已探测路径未匹配不等于没有内核 cgroup 归属。")
+                .append("缓存与跨轮发现仅提供候选目录，未完成本轮覆盖时不确认缺失。")
                 .append("该线索独立于 CPU，不能据此认定 root 身份或 GPU 使用。\n");
     }
 

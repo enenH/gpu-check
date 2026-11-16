@@ -132,6 +132,7 @@ public final class DashboardUiInstrumentation extends Instrumentation {
             }
 
             onMain(() -> {
+                verifyCgroupCoverage();
                 inject("{not-valid-json: UI fixture", true);
                 checkCleared(true);
                 check(text("heroStatus").contains("异常"), "Malformed report must show a readable error state");
@@ -198,6 +199,36 @@ public final class DashboardUiInstrumentation extends Instrumentation {
         check(text("startButton").equals("停止检测"), "Active session does not offer stop");
         check(processPids().equals(Arrays.asList(ROOT_PID, FIRST_TIE_PID, SECOND_TIE_PID, UNKNOWN_PID)),
                 "CPU ranking/filtering/tie-break/unknown ordering is incorrect: " + processPids());
+    }
+
+    private void verifyCgroupCoverage() throws Exception {
+        JSONObject report = fixture().put("errors", new JSONArray());
+        JSONObject scan = new JSONObject().put("method", CgroupWatchPolicy.METHOD)
+                .put("available", true).put("calibrationValid", true).put("complete", false)
+                .put("status", "partial").put("missingDetectionAvailable", false)
+                .put("freshCoverageThisSample", false);
+        report.put("cgroupScan", scan);
+        inject(report.toString(), true);
+        check(text("sampleStatus").contains(getTargetContext().getString(R.string.cgroup_check_partial)),
+                "Partial layouts must explain that missing paths cannot be confirmed");
+        check(!text("errorText").contains(getTargetContext().getString(R.string.cgroup_check_unavailable)),
+                "A usable partial layout must not be reported as entirely unavailable");
+
+        scan.put("missingDetectionAvailable", true).put("freshCoverageThisSample", true)
+                .put("complete", true).put("status", "complete");
+        inject(report.toString(), true);
+        check(text("sampleStatus").contains(getTargetContext().getString(R.string.cgroup_check_available)),
+                "Complete current coverage did not restore the available state");
+        check(!text("sampleStatus").contains(getTargetContext().getString(R.string.cgroup_check_partial)),
+                "Partial warning survived coverage recovery");
+
+        scan.put("available", false).put("calibrationValid", false)
+                .put("missingDetectionAvailable", false).put("freshCoverageThisSample", false);
+        inject(report.toString(), true);
+        check(text("errorText").contains(getTargetContext().getString(R.string.cgroup_check_unavailable)),
+                "No usable layouts must still report unavailable calibration");
+        check(!text("sampleStatus").contains(getTargetContext().getString(R.string.cgroup_check_partial)),
+                "Stale partial availability survived loss of every layout");
     }
 
     private void checkCleared(boolean malformed) throws Exception {
